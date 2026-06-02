@@ -1,30 +1,43 @@
-//! REST handlers — the gateway transport of the push binding.
+//! The gateway's `push/*` Trust-Task dispatcher (HTTPS binding).
 //!
-//! - `POST /v1/register`  (device, unauthenticated) → issue an opaque handle.
-//! - `POST /v1/provision` (controller VTA, did-signed) → set a handle's allowlist.
-//! - `POST /v1/wake`      (trigger, did-signed) → contentless wake if allowed.
+//! `POST /trust-tasks` accepts a [`TrustTask`] document and dispatches by type
+//! URI to the push control plane:
 //!
-//! `provision` and `wake` authenticate by verifying an Ed25519 signature over
-//! the raw request body against the caller's `did:key` ([`crate::auth`]).
+//! - `push/register/0.1`  — device → opaque handle (token held by gateway).
+//! - `push/provision/0.1` — controller VTA → set the handle's trigger allowlist.
+//! - `push/wake/0.1`      — trigger → contentless wake, allowlist-gated.
+//!
+//! The envelope (`TrustTask` + `respond_with`/`reject_with` + `RejectReason`)
+//! is the canonical `trust_tasks_rs` form, so the same documents ride the
+//! DIDComm binding (added next — the *preferred* transport) without per-
+//! transport auth code. Over HTTPS the caller authenticates by signing the raw
+//! body with its `did:key` (the [`crate::auth`] `X-TT-Did`/`X-TT-Signature`
+//! scheme); that authenticated DID is the sender used for authorization.
 
 use std::sync::Arc;
 
 use axum::{
     body::Bytes,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::post,
+    routing::{get, post},
     Json, Router,
 };
 use rand::RngCore;
+use serde::Serialize;
+use serde_json::{json, Value};
+use trust_tasks_rs::{RejectReason, TrustTask};
+use uuid::Uuid;
 
 use crate::auth::{self, HEADER_DID, HEADER_SIG};
 use crate::sender::{self, PushSender, SendOutcome};
 use crate::store::{ProvisionOutcome, Store, WakeAuthz};
-use crate::types::{
-    ProvisionRequest, RegisterRequest, RegisterResponse, WakeHandle, WakePayload, WakeRequest,
-};
+use crate::types::{ProvisionRequest, RegisterRequest, WakePayload, WakeRequest};
+
+const PUSH_REGISTER: &str = "https://trusttasks.org/spec/push/register/0.1";
+const PUSH_PROVISION: &str = "https://trusttasks.org/spec/push/provision/0.1";
+const PUSH_WAKE: &str = "https://trusttasks.org/spec/push/wake/0.1";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -36,72 +49,13 @@ pub struct AppState {
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/v1/register", post(register))
-        .route("/v1/provision", post(provision))
-        .route("/v1/wake", post(wake))
-        .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .route("/trust-tasks", post(trust_tasks))
+        .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
 }
 
-/// A handler error that renders as a small JSON body. Kept small (so it's a
-/// cheap `Result` `Err`) and converted to a `Response` only at the edge.
-struct ApiError {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
-}
-
-impl ApiError {
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            code,
-            message: message.into(),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({ "error": self.code, "message": self.message })),
-        )
-            .into_response()
-    }
-}
-
-fn parse_json<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, ApiError> {
-    serde_json::from_slice(body)
-        .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, "invalid_body", e.to_string()))
-}
-
-/// Authenticate a did-signed request: verify the signature over the raw body and
-/// return the caller's DID.
-fn authenticate(headers: &HeaderMap, body: &Bytes) -> Result<String, ApiError> {
-    let did = headers
-        .get(HEADER_DID)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "missing_did",
-                "X-TT-Did header required",
-            )
-        })?;
-    let sig = headers
-        .get(HEADER_SIG)
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                "missing_signature",
-                "X-TT-Signature header required",
-            )
-        })?;
-    auth::verify_signed(did, sig, body)
-        .map_err(|e| ApiError::new(StatusCode::UNAUTHORIZED, "auth_failed", e.to_string()))?;
-    Ok(did.to_string())
+fn new_id() -> String {
+    format!("urn:uuid:{}", Uuid::new_v4())
 }
 
 /// Issue a fresh opaque handle (32 bytes of CSPRNG, base58btc).
@@ -111,86 +65,180 @@ fn new_handle() -> String {
     bs58::encode(b).into_string()
 }
 
-async fn register(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
-    let req: RegisterRequest = parse_json(&body)?;
-    // Reject a registration whose platform no sender handles, rather than
-    // silently dropping wakes later (binding §8).
+/// Serialize a response document (success `TrustTask` or `trust-task-error`) as
+/// an HTTP 200 JSON body — the in-band Trust Task envelope carries the outcome.
+fn doc_response<T: Serialize>(doc: &T) -> Response {
+    match serde_json::to_vec(doc) {
+        Ok(b) => (StatusCode::OK, [(CONTENT_TYPE, "application/json")], b).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "encode", "message": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+fn reject(doc: &TrustTask<Value>, reason: RejectReason) -> Response {
+    doc_response(&doc.reject_with(new_id(), reason))
+}
+
+/// Authenticate the request if it is did-signed: verify the signature over the
+/// raw body and return the caller DID. Absent headers → `Ok(None)` (anonymous,
+/// allowed for `push/register`). A present-but-invalid signature → `Err(401)`.
+// The `Err` is a ready-to-return HTTP `Response` (short-circuit), so its size is
+// intentional — this isn't a hot-path value moved around.
+#[allow(clippy::result_large_err)]
+fn authenticate(headers: &HeaderMap, body: &Bytes) -> Result<Option<String>, Response> {
+    let did = headers.get(HEADER_DID).and_then(|v| v.to_str().ok());
+    let sig = headers.get(HEADER_SIG).and_then(|v| v.to_str().ok());
+    match (did, sig) {
+        (Some(d), Some(s)) => match auth::verify_signed(d, s, body) {
+            Ok(()) => Ok(Some(d.to_string())),
+            Err(e) => Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "auth_failed", "message": e.to_string() })),
+            )
+                .into_response()),
+        },
+        _ => Ok(None),
+    }
+}
+
+async fn trust_tasks(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let doc: TrustTask<Value> = match serde_json::from_slice(&body) {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_body", "message": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+    let sender = match authenticate(&headers, &body) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    match doc.type_uri.to_string().as_str() {
+        PUSH_REGISTER => handle_register(&state, &doc),
+        PUSH_PROVISION => handle_provision(&state, sender, &doc),
+        PUSH_WAKE => handle_wake(&state, sender, &doc),
+        other => reject(
+            &doc,
+            RejectReason::UnsupportedType {
+                type_uri: other.to_string(),
+            },
+        ),
+    }
+}
+
+#[allow(clippy::result_large_err)] // Err is a ready-to-return Response (short-circuit).
+fn parse<T: serde::de::DeserializeOwned>(doc: &TrustTask<Value>) -> Result<T, Response> {
+    serde_json::from_value(doc.payload.clone()).map_err(|e| {
+        reject(
+            doc,
+            RejectReason::MalformedRequest {
+                reason: format!("payload: {e}"),
+            },
+        )
+    })
+}
+
+/// `push/register` — unauthenticated by design (the handle is opaque and useless
+/// until its VTA provisions a trigger allowlist).
+fn handle_register(state: &AppState, doc: &TrustTask<Value>) -> Response {
+    let req: RegisterRequest = match parse(doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     if sender::select(&state.senders, &req.registration).is_none() {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unsupported_platform",
-            "no sender configured for this platform",
-        ));
+        return reject(
+            doc,
+            RejectReason::TaskFailed {
+                reason: "no sender configured for this platform".into(),
+                details: None,
+            },
+        );
     }
     let handle = new_handle();
     state
         .store
         .insert(handle.clone(), req.registration, req.controller_vta_did);
-    Ok((
-        StatusCode::CREATED,
-        Json(RegisterResponse {
-            wake_handle: WakeHandle {
-                gateway: state.gateway_addr.clone(),
-                handle,
-            },
-        }),
-    )
-        .into_response())
+    doc_response(&doc.respond_with(
+        new_id(),
+        json!({ "wakeHandle": { "gateway": state.gateway_addr, "handle": handle } }),
+    ))
 }
 
-async fn provision(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    let caller = authenticate(&headers, &body)?;
-    let req: ProvisionRequest = parse_json(&body)?;
+/// `push/provision` — only the handle's controller VTA may set its allowlist.
+fn handle_provision(state: &AppState, sender: Option<String>, doc: &TrustTask<Value>) -> Response {
+    let Some(caller) = sender else {
+        return reject(doc, RejectReason::ProofRequired);
+    };
+    let req: ProvisionRequest = match parse(doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+    let triggers = req.policy.allowed_triggers.clone();
     match state.store.provision(&req.handle, &caller, req.policy) {
-        ProvisionOutcome::Ok => Ok(StatusCode::NO_CONTENT.into_response()),
-        ProvisionOutcome::UnknownHandle => Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "unknown_handle",
-            "no such handle",
+        ProvisionOutcome::Ok => doc_response(&doc.respond_with(
+            new_id(),
+            json!({ "handle": req.handle, "policy": { "allowedTriggers": triggers } }),
         )),
-        ProvisionOutcome::NotController => Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "not_controller",
-            "caller is not this handle's controller VTA",
-        )),
+        ProvisionOutcome::UnknownHandle => reject(
+            doc,
+            RejectReason::TaskFailed {
+                reason: "unknown handle".into(),
+                details: None,
+            },
+        ),
+        ProvisionOutcome::NotController => reject(
+            doc,
+            RejectReason::PermissionDenied {
+                reason: "caller is not this handle's controller VTA".into(),
+            },
+        ),
     }
 }
 
-async fn wake(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    let trigger = authenticate(&headers, &body)?;
-    let req: WakeRequest = parse_json(&body)?;
+/// `push/wake` — fire the contentless doorbell iff the trigger is allowlisted.
+fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<Value>) -> Response {
+    let Some(trigger) = sender else {
+        return reject(doc, RejectReason::ProofRequired);
+    };
+    let req: WakeRequest = match parse(doc) {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
     let registration = match state.store.authorize_wake(&req.handle, &trigger) {
         WakeAuthz::Allowed(reg) => reg,
         WakeAuthz::UnknownHandle => {
-            return Err(ApiError::new(
-                StatusCode::NOT_FOUND,
-                "unknown_handle",
-                "no such handle",
-            ))
+            return reject(
+                doc,
+                RejectReason::TaskFailed {
+                    reason: "unknown handle".into(),
+                    details: None,
+                },
+            );
         }
         WakeAuthz::NotAllowed => {
-            return Err(ApiError::new(
-                StatusCode::FORBIDDEN,
-                "not_allowed",
-                "trigger DID is not on this handle's allowlist",
-            ))
+            return reject(
+                doc,
+                RejectReason::PermissionDenied {
+                    reason: "trigger DID is not on this handle's allowlist".into(),
+                },
+            );
         }
     };
-
     let Some(s) = sender::select(&state.senders, &registration) else {
-        return Err(ApiError::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "unsupported_platform",
-            "no sender for this handle's platform",
-        ));
+        return reject(
+            doc,
+            RejectReason::TaskFailed {
+                reason: "no sender for this handle's platform".into(),
+                details: None,
+            },
+        );
     };
     let payload = WakePayload {
         v: req.v,
@@ -199,21 +247,20 @@ async fn wake(
         urgency: req.urgency,
     };
     match s.send(&registration, &payload) {
-        SendOutcome::Delivered => Ok(StatusCode::ACCEPTED.into_response()),
-        SendOutcome::TransientFailure => Err(ApiError::new(
-            StatusCode::BAD_GATEWAY,
-            "push_failed",
-            "transient push-service failure; message remains queued",
-        )),
+        SendOutcome::Delivered => {
+            doc_response(&doc.respond_with(new_id(), json!({ "status": "delivered" })))
+        }
+        SendOutcome::TransientFailure => reject(
+            doc,
+            RejectReason::TaskFailed {
+                reason: "transient push-service failure; message remains queued".into(),
+                details: None,
+            },
+        ),
         SendOutcome::PermanentlyUnregistered => {
-            // Binding §3.2: drop the dead token; the message stays queued for
-            // the consumer's next voluntary pickup.
+            // Binding §3.2: drop the dead token; report it in-band.
             state.store.remove(&req.handle);
-            Err(ApiError::new(
-                StatusCode::GONE,
-                "token_dead",
-                "push token permanently unregistered; handle dropped",
-            ))
+            doc_response(&doc.respond_with(new_id(), json!({ "status": "token-unregistered" })))
         }
     }
 }

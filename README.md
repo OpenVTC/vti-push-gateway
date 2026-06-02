@@ -20,52 +20,66 @@ the VTA owns the allowlist).
 
 ## Status
 
-**Scaffold (Phase 1 / B1).** REST surface + in-memory stores + did-signed auth +
-a dev **echo sender** (logs the wake, delivers nothing). This is enough to
-exercise register → provision → wake → push end-to-end with no Apple/Google
-account. Not production-ready.
+The gateway's control plane is the **`push/*` Trust Task family**
+([`push/register`](https://trusttasks.org/spec/push/register/0.1),
+[`push/provision`](https://trusttasks.org/spec/push/provision/0.1),
+[`push/wake`](https://trusttasks.org/spec/push/wake/0.1)). It dispatches
+`TrustTask` documents (canonical `trust-tasks-rs` envelope), so the same
+documents ride the **DIDComm binding (preferred) or HTTPS (fallback)**.
 
-Roadmap: Web Push (VAPID) sender · APNs · FCM · persistent store · DIDComm
-transport · metrics.
+Implemented: the **HTTPS** transport + in-memory stores + a dev **echo sender**
+(logs the wake, delivers nothing) — enough to exercise register → provision →
+wake end-to-end with no Apple/Google account. Not production-ready.
+
+Roadmap: **DIDComm transport** (the preferred path — gateway DID + unpack) ·
+Web Push (VAPID) sender · APNs · FCM · persistent store · metrics.
 
 ## API
 
-| Method | Path            | Caller          | Auth                | Purpose |
-|--------|-----------------|-----------------|---------------------|---------|
-| POST   | `/v1/register`  | device          | none                | register a push token → opaque `WakeHandle` |
-| POST   | `/v1/provision` | controller VTA  | did-signed          | set a handle's trigger allowlist |
-| POST   | `/v1/wake`      | trigger (mediator/VTA) | did-signed   | request a contentless wake (allowlist-gated) |
-| GET    | `/healthz`      | —               | none                | liveness |
+A single Trust-Task endpoint dispatches by the document's `type`:
 
-### Authentication (`provision`, `wake`)
+| Method | Path            | `type`                | Caller | Auth (HTTPS) |
+|--------|-----------------|-----------------------|--------|--------------|
+| POST   | `/trust-tasks`  | `push/register/0.1`   | device | none |
+| POST   | `/trust-tasks`  | `push/provision/0.1`  | controller VTA | did-signed |
+| POST   | `/trust-tasks`  | `push/wake/0.1`       | trigger (mediator/VTA) | did-signed |
+| GET    | `/healthz`      | —                     | — | none |
 
-The caller signs the **raw request body bytes** with its `did:key` Ed25519 key
-and sends:
+Success returns a `…#response` Trust Task document; failure returns a
+`trust-task-error/0.1` document (the envelope carries the outcome).
+
+### Authentication over HTTPS (`provision`, `wake`)
+
+The caller signs the **raw request body bytes** (the Trust Task document) with
+its `did:key` Ed25519 key:
 
 - `X-TT-Did: did:key:z…` — the caller's did:key (Ed25519).
 - `X-TT-Signature: <base64url>` — Ed25519 signature over the exact body bytes.
 
 The gateway resolves the did:key offline (multicodec/base58btc — no network) and
-verifies. `register` is unauthenticated: a handle is opaque and useless until the
-device's VTA opts a trigger in via `provision`. Replay is harmless by design
-(a duplicate wake is an idempotent doorbell; a re-sent provision sets the same
-allowlist), so no nonce is required — see binding §6.
+verifies. `register` is unauthenticated (the handle is opaque and useless until
+the device's VTA provisions a trigger). Over the **DIDComm** transport (next),
+the authcrypt sender authenticates the caller intrinsically — no signature
+header. Replay is harmless by design (a duplicate wake is an idempotent
+doorbell), so no nonce is required — see binding §6.
 
-### Examples
+### Example (HTTPS)
 
 ```jsonc
-// POST /v1/register
-{ "registration": { "platform": "apns", "token": "…", "topic": "org.openvtc.vta-mobile-agent" },
-  "controllerVtaDid": "did:web:vta.example" }
-// → 201 { "wake_handle": { "gateway": "https://gw.example", "handle": "z6Mk…opaque" } }
+// POST /trust-tasks   — push/register (unauthenticated)
+{ "id": "urn:uuid:1", "type": "https://trusttasks.org/spec/push/register/0.1",
+  "payload": { "registration": { "platform": "apns", "token": "…", "topic": "org.openvtc.vta-mobile-agent" },
+               "controllerVtaDid": "did:webvh:…:vta" } }
+// → 200  …#response  { "payload": { "wakeHandle": { "gateway": "https://gw.example", "handle": "z6Mk…" } } }
 
-// POST /v1/provision   (signed by did:web:vta.example)
-{ "handle": "z6Mk…opaque", "policy": { "allowed_triggers": ["did:web:mediator", "did:web:vta.example"] } }
-// → 204
+// POST /trust-tasks   — push/provision (signed by the controller VTA)
+{ "id": "urn:uuid:2", "type": "https://trusttasks.org/spec/push/provision/0.1",
+  "payload": { "handle": "z6Mk…", "policy": { "allowedTriggers": ["did:webvh:…:mediator", "did:webvh:…:vta"] } } }
 
-// POST /v1/wake        (signed by an allowed trigger DID)
-{ "handle": "z6Mk…opaque", "v": 1, "mediator": "did:web:mediator", "urgency": "interactive" }
-// → 202   (echo sender logs the contentless wake)
+// POST /trust-tasks   — push/wake (signed by an allowed trigger)
+{ "id": "urn:uuid:3", "type": "https://trusttasks.org/spec/push/wake/0.1",
+  "payload": { "handle": "z6Mk…", "v": 1, "mediator": "did:webvh:…:mediator", "urgency": "interactive" } }
+// → 200  …#response  { "payload": { "status": "delivered" } }  (echo sender logs the contentless wake)
 ```
 
 ## Run

@@ -1,11 +1,10 @@
-//! Wire types for the push gateway's REST surface.
+//! Payload bodies for the gateway's `push/*` Trust Tasks.
 //!
-//! These mirror the shapes in the push wake-up binding
-//! (<https://trusttasks.org/binding/push/0.1>) and the `device/_shared`
-//! `WakeHandle` / `WakeTriggerPolicy` definitions. The gateway owns its own
-//! DTOs rather than depending on `trust-tasks-rs` — the REST contract is the
-//! spec, not a shared Rust type, and platform-token specifics live here in the
-//! gateway by design (a trigger or VTA never names a platform).
+//! These mirror the `push/register|provision|wake` payload schemas
+//! (<https://trusttasks.org/spec/push/*>) — the *envelope* is the canonical
+//! `trust_tasks_rs::TrustTask`, and these are the typed bodies the dispatcher
+//! deserialises out of `doc.payload`. Platform-token specifics live here in the
+//! gateway by design (a trigger/VTA never names a platform).
 
 use serde::{Deserialize, Serialize};
 
@@ -16,28 +15,22 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "platform", rename_all = "lowercase")]
 pub enum PushRegistration {
     Apns {
-        /// APNs device token (hex string from Apple Push Notification service).
         token: String,
-        /// APNs topic — typically the app bundle id.
         topic: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         environment: Option<ApnsEnvironment>,
     },
     Fcm {
-        /// Firebase Cloud Messaging registration token.
         token: String,
     },
     Webpush {
-        /// RFC 8030 Web Push subscription endpoint.
         endpoint: String,
-        /// RFC 8291 encryption keys (p256dh + auth).
         keys: WebPushKeys,
     },
 }
 
 impl PushRegistration {
-    /// The abstract platform kind, for the device-facing `pushPlatform` hint and
-    /// logging. Never reveals the token.
+    /// The abstract platform kind, for logging. Never reveals the token.
     pub fn platform(&self) -> &'static str {
         match self {
             PushRegistration::Apns { .. } => "apns",
@@ -56,73 +49,44 @@ pub enum ApnsEnvironment {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebPushKeys {
-    /// base64url-encoded P-256 ECDH public key.
     pub p256dh: String,
-    /// base64url-encoded auth secret.
     pub auth: String,
 }
 
-/// `POST /v1/register` request — a device registers its push token and names the
-/// VTA that will own its trigger allowlist.
+/// `push/register/0.1` payload — register a token, name the controller VTA.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterRequest {
     pub registration: PushRegistration,
-    /// The DID of the VTA permitted to provision this handle's allowlist
-    /// (`device/set-wake` is conveyed to this VTA, which then provisions here).
     pub controller_vta_did: String,
-}
-
-/// An opaque, gateway-issued reference to a device's push channel. Mirrors
-/// `device/_shared` `WakeHandle`. The `handle` reveals no platform token.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WakeHandle {
-    /// This gateway's address (https URL or DID) — where triggers send wakes.
-    pub gateway: String,
-    /// Opaque gateway-issued identifier for the device's push channel.
-    pub handle: String,
-}
-
-/// `POST /v1/register` response.
-#[derive(Debug, Clone, Serialize)]
-pub struct RegisterResponse {
-    pub wake_handle: WakeHandle,
 }
 
 /// VTA-owned allowlist of the DIDs permitted to trigger a wake for a handle.
 /// Mirrors `device/_shared` `WakeTriggerPolicy`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WakeTriggerPolicy {
-    /// DIDs authorized to trigger a wake for this handle. Empty = no party may
-    /// wake the device.
     #[serde(default)]
     pub allowed_triggers: Vec<String>,
 }
 
-/// `POST /v1/provision` request — the controller VTA sets a handle's allowlist.
-/// Authenticated as the controller VTA's DID (see [`crate::auth`]).
+/// `push/provision/0.1` payload — set a handle's allowlist.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProvisionRequest {
     pub handle: String,
     pub policy: WakeTriggerPolicy,
 }
 
-/// `POST /v1/wake` request — a trigger (mediator or VTA) asks the gateway to send
-/// a contentless wake. Authenticated as the trigger's DID. Carries only the
-/// binding §2 contentless hint fields — never task content.
+/// `push/wake/0.1` payload — contentless wake request. Carries only the binding
+/// §2 hint fields; never task content.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WakeRequest {
     pub handle: String,
-    /// Binding wire version — the integer `1`.
     pub v: u8,
-    /// The mediator holding the queued messages, so a multi-mediator consumer
-    /// knows which to drain. Echoed into the push payload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mediator: Option<String>,
-    /// Approximate queued-message count (advisory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub count: Option<u32>,
-    /// `interactive` | `background` urgency hint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub urgency: Option<Urgency>,
 }

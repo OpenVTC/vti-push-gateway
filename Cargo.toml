@@ -25,6 +25,12 @@ bs58 = "0.5"
 base64 = "0.22"
 # Opaque handle generation (CSPRNG).
 rand = "0.8"
+# Canonical Trust Task envelope + the push/* payload types (the gateway's
+# control plane is the push/* Trust Task family). The gateway dispatches
+# push/register|provision|wake documents over HTTPS (and, next, DIDComm).
+trust-tasks-rs = { version = "0.1", default-features = false }
+# Response document ids (urn:uuid).
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

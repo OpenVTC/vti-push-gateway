@@ -31,6 +31,15 @@ rand = "0.8"
 trust-tasks-rs = { version = "0.1", default-features = false }
 # Response document ids (urn:uuid).
 uuid = { version = "1", features = ["v4"] }
+# DIDComm server transport (the preferred transport). Mirrors vta-service:
+# DIDCommService + Router host that does server-side unpack + sender-auth; the
+# gateway provides its provisioned did:webvh identity secrets + a Router of
+# push/* handlers that call the shared dispatch_push core.
+affinidi-messaging-didcomm-service = "0.3"
+affinidi-tdk = "0.7"
+affinidi-secrets-resolver = "0.5"
+affinidi-did-resolver-cache-sdk = { version = "0.8", features = ["network"] }
+tokio-util = "0.7"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

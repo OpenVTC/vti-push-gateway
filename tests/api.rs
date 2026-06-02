@@ -11,9 +11,9 @@ use http_body_util::BodyExt;
 use rand::rngs::OsRng;
 use tower::ServiceExt;
 
-use vta_push_gateway::api::{router, AppState};
-use vta_push_gateway::sender::{EchoSender, PushSender};
-use vta_push_gateway::store::Store;
+use vti_push_gateway::api::{router, AppState};
+use vti_push_gateway::sender::{EchoSender, PushSender};
+use vti_push_gateway::store::Store;
 
 const ED25519_MULTICODEC: [u8; 2] = [0xed, 0x01];
 

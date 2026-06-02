@@ -1,4 +1,4 @@
-//! vta-push-gateway — the push wake-up gateway for the OpenVTC mobile
+//! vti-push-gateway — the push wake-up gateway for the OpenVTC mobile
 //! authenticator. Implements <https://trusttasks.org/binding/push/0.1>: holds
 //! the app's platform push credentials, issues opaque wake handles, enforces a
 //! VTA-provisioned trigger allowlist, and relays **contentless** wakes.
@@ -8,16 +8,16 @@
 
 use std::sync::Arc;
 
-use vta_push_gateway::api::{self, AppState};
-use vta_push_gateway::sender::{EchoSender, PushSender};
-use vta_push_gateway::store::Store;
+use vti_push_gateway::api::{self, AppState};
+use vti_push_gateway::sender::{EchoSender, PushSender};
+use vti_push_gateway::store::Store;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "vta_push_gateway=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "vti_push_gateway=info,tower_http=info".into()),
         )
         .init();
 
@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::warn!(
         %bind, %gateway_addr,
-        "vta-push-gateway up (SCAFFOLD: echo sender only — no real pushes are delivered)"
+        "vti-push-gateway up (SCAFFOLD: echo sender only — no real pushes are delivered)"
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

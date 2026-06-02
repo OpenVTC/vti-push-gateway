@@ -1,10 +1,10 @@
 [package]
-name = "vta-push-gateway"
+name = "vti-push-gateway"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "Push wake-up gateway for the OpenVTC mobile authenticator. Holds the app's platform push credentials, issues opaque wake handles, enforces a VTA-provisioned trigger allowlist, and relays contentless wake notifications. Implements https://trusttasks.org/binding/push/0.1."
-repository = "https://github.com/OpenVTC/vta-push-gateway"
+repository = "https://github.com/OpenVTC/vti-push-gateway"
 rust-version = "1.85"
 
 [dependencies]

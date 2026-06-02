@@ -1,4 +1,4 @@
-# vta-push-gateway
+# vti-push-gateway
 
 The **push wake-up gateway** for the OpenVTC mobile authenticator. It implements
 the [push wake-up binding](https://trusttasks.org/binding/push/0.1) — the third
@@ -74,7 +74,7 @@ allowlist), so no nonce is required — see binding §6.
 cargo run
 # GATEWAY_BIND=127.0.0.1:8300   bind address
 # GATEWAY_ADDR=https://gw.example   address advertised in issued handles (behind TLS/proxy)
-# RUST_LOG=vta_push_gateway=debug
+# RUST_LOG=vti_push_gateway=debug
 ```
 
 ## Security notes

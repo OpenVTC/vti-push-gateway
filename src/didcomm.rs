@@ -49,7 +49,7 @@ async fn handle_push(
         }
     };
     // `message.from` is the authcrypt-authenticated sender (None for anoncrypt).
-    let response = dispatch_push(&state, message.from.clone(), &doc);
+    let response = dispatch_push(&state, message.from.clone(), &doc).await;
     Ok(Some(DIDCommResponse::new(
         TRUST_TASK_ENVELOPE_TYPE,
         response,

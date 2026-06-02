@@ -103,15 +103,15 @@ fn parse<T: serde::de::DeserializeOwned>(doc: &TrustTask<Value>) -> Result<T, Va
 /// Perform a `push/*` operation and return the response document. `sender` is
 /// the authenticated caller DID (`None` if the transport authenticated no one —
 /// allowed for `push/register`). Shared by every transport adapter.
-pub(crate) fn dispatch_push(
+pub(crate) async fn dispatch_push(
     state: &AppState,
     sender: Option<String>,
     doc: &TrustTask<Value>,
 ) -> Value {
     match doc.type_uri.to_string().as_str() {
-        PUSH_REGISTER => handle_register(state, doc),
-        PUSH_PROVISION => handle_provision(state, sender, doc),
-        PUSH_WAKE => handle_wake(state, sender, doc),
+        PUSH_REGISTER => handle_register(state, doc).await,
+        PUSH_PROVISION => handle_provision(state, sender, doc).await,
+        PUSH_WAKE => handle_wake(state, sender, doc).await,
         other => reject_value(
             doc,
             RejectReason::UnsupportedType {
@@ -123,7 +123,7 @@ pub(crate) fn dispatch_push(
 
 /// `push/register` — unauthenticated by design (the handle is opaque and useless
 /// until its VTA provisions a trigger allowlist).
-fn handle_register(state: &AppState, doc: &TrustTask<Value>) -> Value {
+async fn handle_register(state: &AppState, doc: &TrustTask<Value>) -> Value {
     let req: RegisterRequest = match parse(doc) {
         Ok(r) => r,
         Err(v) => return v,
@@ -148,7 +148,11 @@ fn handle_register(state: &AppState, doc: &TrustTask<Value>) -> Value {
 }
 
 /// `push/provision` — only the handle's controller VTA may set its allowlist.
-fn handle_provision(state: &AppState, sender: Option<String>, doc: &TrustTask<Value>) -> Value {
+async fn handle_provision(
+    state: &AppState,
+    sender: Option<String>,
+    doc: &TrustTask<Value>,
+) -> Value {
     let Some(caller) = sender else {
         return reject_value(doc, RejectReason::ProofRequired);
     };
@@ -179,7 +183,7 @@ fn handle_provision(state: &AppState, sender: Option<String>, doc: &TrustTask<Va
 }
 
 /// `push/wake` — fire the contentless doorbell iff the trigger is allowlisted.
-fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<Value>) -> Value {
+async fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<Value>) -> Value {
     let Some(trigger) = sender else {
         return reject_value(doc, RejectReason::ProofRequired);
     };
@@ -222,7 +226,7 @@ fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<Value>)
         count: req.count,
         urgency: req.urgency,
     };
-    match s.send(&registration, &payload) {
+    match s.send(&registration, &payload).await {
         SendOutcome::Delivered => success_value(doc, json!({ "status": "delivered" })),
         SendOutcome::TransientFailure => reject_value(
             doc,
@@ -291,5 +295,5 @@ async fn trust_tasks(State(state): State<AppState>, headers: HeaderMap, body: By
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    http_doc(dispatch_push(&state, sender, &doc))
+    http_doc(dispatch_push(&state, sender, &doc).await)
 }

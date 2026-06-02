@@ -1,0 +1,32 @@
+[package]
+name = "vta-push-gateway"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Push wake-up gateway for the OpenVTC mobile authenticator. Holds the app's platform push credentials, issues opaque wake handles, enforces a VTA-provisioned trigger allowlist, and relays contentless wake notifications. Implements https://trusttasks.org/binding/push/0.1."
+repository = "https://github.com/OpenVTC/vta-push-gateway"
+rust-version = "1.85"
+
+[dependencies]
+# HTTP surface (the REST gateway transport of the push binding). axum/tower
+# mirror the trust-tasks-https binding's server stack.
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tower-http = { version = "0.6", features = ["trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+# Trigger / provision authentication: callers sign the request body with their
+# did:key Ed25519 key; the gateway resolves the did:key offline and verifies.
+ed25519-dalek = "2"
+bs58 = "0.5"
+base64 = "0.22"
+# Opaque handle generation (CSPRNG).
+rand = "0.8"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }

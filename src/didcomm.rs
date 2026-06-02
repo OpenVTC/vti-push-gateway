@@ -4,8 +4,9 @@
 //! uses), which does the server-side work — connect to the mediator, receive,
 //! **unpack + authenticate the authcrypt sender** — and routes each message to
 //! a handler. The gateway provides its provisioned `did:webvh` identity secrets
-//! (a [`TDKProfile`]) and a [`Router`] mapping the `push/*` type URIs to a
-//! handler that calls the shared [`dispatch_push`] core.
+//! (a [`TDKProfile`]) and a [`Router`] that — like the VTA — routes the single
+//! Trust Task envelope type to a handler calling the shared [`dispatch_push`]
+//! core, which dispatches on the `push/*` `type` inside the body.
 //!
 //! Authentication is intrinsic: the unpacked [`Message`]'s `from` is the
 //! cryptographically-authenticated sender — no `X-TT-Did` header, no hand-rolled
@@ -23,7 +24,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use trust_tasks_rs::TrustTask;
 
-use crate::api::{dispatch_push, AppState, PUSH_PROVISION, PUSH_REGISTER, PUSH_WAKE};
+use crate::api::{dispatch_push, AppState};
 use crate::identity::GatewayIdentity;
 
 /// DIDComm message type wrapping a Trust Task document (the DIDComm binding's
@@ -55,15 +56,16 @@ async fn handle_push(
     )))
 }
 
-/// Build the `push/*` router (+ trust-ping and a no-op for pickup-status).
+/// Build the router. Like the VTA, **one** DIDComm message type
+/// (`TRUST_TASK_ENVELOPE_TYPE`) carries every `push/*` `TrustTask<P>` in its
+/// body; `handle_push` → `dispatch_push` routes on the Trust Task `type` inside
+/// the body. (Plus trust-ping and a no-op for pickup-status.)
 fn build_router(state: AppState) -> Result<Router, DIDCommServiceError> {
     Router::new()
         .extension(state)
         .route(TRUST_PING_TYPE, handler_fn(trust_ping_handler))?
         .route(MESSAGE_PICKUP_STATUS_TYPE, handler_fn(ignore_handler))?
-        .route(PUSH_REGISTER, handler_fn(handle_push))?
-        .route(PUSH_PROVISION, handler_fn(handle_push))?
-        .route(PUSH_WAKE, handler_fn(handle_push))
+        .route(TRUST_TASK_ENVELOPE_TYPE, handler_fn(handle_push))
 }
 
 /// Start the gateway's DIDComm listener: connect to the mediator as the

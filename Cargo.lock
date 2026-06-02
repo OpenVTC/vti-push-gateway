@@ -5405,6 +5405,7 @@ dependencies = [
  "affinidi-messaging-didcomm-service",
  "affinidi-secrets-resolver",
  "affinidi-tdk",
+ "async-trait",
  "axum",
  "base64 0.22.1",
  "bs58 0.5.1",

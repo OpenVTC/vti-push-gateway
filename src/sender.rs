@@ -6,6 +6,8 @@
 //! Web Push (VAPID, self-hostable) lands next; APNs/FCM drop in behind the same
 //! trait once credentials exist.
 
+use async_trait::async_trait;
+
 use crate::types::{PushRegistration, WakePayload};
 
 /// Result of a push send. `PermanentlyUnregistered` triggers the binding §3.2
@@ -19,23 +21,27 @@ pub enum SendOutcome {
 
 /// Sends a contentless wake to a platform push service. Implementations MUST
 /// forward only the [`WakePayload`] fields — never task content.
+///
+/// `send` is **async** — real delivery (Web Push, APNs, FCM) is an HTTP call.
+#[async_trait]
 pub trait PushSender: Send + Sync {
     /// Whether this sender handles the given registration's platform.
     fn handles(&self, registration: &PushRegistration) -> bool;
     /// Deliver the contentless wake to the registration's token.
-    fn send(&self, registration: &PushRegistration, payload: &WakePayload) -> SendOutcome;
+    async fn send(&self, registration: &PushRegistration, payload: &WakePayload) -> SendOutcome;
 }
 
 /// Dev sender: logs the wake and reports `Delivered`. Lets the gateway be tested
 /// end-to-end with no platform credentials. NOT for production wakes.
 pub struct EchoSender;
 
+#[async_trait]
 impl PushSender for EchoSender {
     fn handles(&self, _registration: &PushRegistration) -> bool {
         true
     }
 
-    fn send(&self, registration: &PushRegistration, payload: &WakePayload) -> SendOutcome {
+    async fn send(&self, registration: &PushRegistration, payload: &WakePayload) -> SendOutcome {
         tracing::info!(
             platform = registration.platform(),
             mediator = payload.mediator.as_deref().unwrap_or("-"),

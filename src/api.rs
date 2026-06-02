@@ -35,9 +35,9 @@ use crate::sender::{self, PushSender, SendOutcome};
 use crate::store::{ProvisionOutcome, Store, WakeAuthz};
 use crate::types::{ProvisionRequest, RegisterRequest, WakePayload, WakeRequest};
 
-const PUSH_REGISTER: &str = "https://trusttasks.org/spec/push/register/0.1";
-const PUSH_PROVISION: &str = "https://trusttasks.org/spec/push/provision/0.1";
-const PUSH_WAKE: &str = "https://trusttasks.org/spec/push/wake/0.1";
+pub(crate) const PUSH_REGISTER: &str = "https://trusttasks.org/spec/push/register/0.1";
+pub(crate) const PUSH_PROVISION: &str = "https://trusttasks.org/spec/push/provision/0.1";
+pub(crate) const PUSH_WAKE: &str = "https://trusttasks.org/spec/push/wake/0.1";
 
 #[derive(Clone)]
 pub struct AppState {

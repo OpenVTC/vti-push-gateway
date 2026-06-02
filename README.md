@@ -31,8 +31,16 @@ Implemented: the **HTTPS** transport + in-memory stores + a dev **echo sender**
 (logs the wake, delivers nothing) — enough to exercise register → provision →
 wake end-to-end with no Apple/Google account. Not production-ready.
 
-Roadmap: **DIDComm transport** (the preferred path — gateway DID + unpack) ·
-Web Push (VAPID) sender · APNs · FCM · persistent store · metrics.
+**DIDComm transport (preferred)** is wired: when `GATEWAY_IDENTITY_FILE`
+provides the gateway's provisioned `did:webvh` identity, a `DIDCommService`
+(`affinidi-messaging-didcomm-service`) connects to the mediator and dispatches
+inbound `push/*` to the same core — the crate does the unpack + sender-auth.
+Identity is provisioned like any integration: `pnm bootstrap
+provision-integration --template push-gateway --var URL=<gateway-didcomm-url>`,
+then open the bundle into the identity file.
+
+Roadmap: Web Push (VAPID) sender · APNs · FCM · persistent store · metrics ·
+networked-resolver tuning for `did:webvh` senders.
 
 ## API
 
@@ -86,10 +94,16 @@ doorbell), so no nonce is required — see binding §6.
 
 ```sh
 cargo run
-# GATEWAY_BIND=127.0.0.1:8300   bind address
-# GATEWAY_ADDR=https://gw.example   address advertised in issued handles (behind TLS/proxy)
+# GATEWAY_BIND=127.0.0.1:8300   bind address (HTTPS transport)
+# GATEWAY_ADDR=https://gw.example   handle gateway field when HTTPS-only (no identity)
+# GATEWAY_IDENTITY_FILE=./gateway-identity.json   provisioned did:webvh identity →
+#                       enables the DIDComm transport; handles advertise the DID
 # RUST_LOG=vti_push_gateway=debug
 ```
+
+With `GATEWAY_IDENTITY_FILE` set the gateway connects to the mediator named in
+the identity and serves `push/*` over DIDComm (preferred) as well as HTTPS;
+without it, HTTPS-only. See `src/identity.rs` for the identity file shape.
 
 ## Security notes
 

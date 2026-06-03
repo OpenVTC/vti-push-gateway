@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use vti_push_gateway::api::{self, AppState};
 use vti_push_gateway::didcomm;
 use vti_push_gateway::identity::GatewayIdentity;
-use vti_push_gateway::sender::{EchoSender, PushSender};
+use vti_push_gateway::sender::{EchoSender, PushSender, WebPushSender};
 use vti_push_gateway::store::Store;
 
 #[tokio::main]
@@ -50,9 +50,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => std::env::var("GATEWAY_ADDR").unwrap_or_else(|_| format!("http://{bind}")),
     };
 
-    // Dev echo sender only — does NOT deliver real pushes. Real senders
-    // (Web Push / APNs / FCM) register here behind the same trait.
-    let senders: Vec<Box<dyn PushSender>> = vec![Box::new(EchoSender)];
+    // Senders are tried in order (first that `handles` the platform wins). The
+    // Web Push (VAPID) sender — enabled by GATEWAY_VAPID_KEY_FILE — handles
+    // `webpush` for real; the echo sender (handles every platform) is the
+    // fallback for apns/fcm (dev) and for webpush when no VAPID key is set.
+    let mut senders: Vec<Box<dyn PushSender>> = Vec::new();
+    if let Ok(pem_path) = std::env::var("GATEWAY_VAPID_KEY_FILE") {
+        let pem = std::fs::read(&pem_path)?;
+        let subject = std::env::var("GATEWAY_VAPID_SUBJECT")
+            .unwrap_or_else(|_| "mailto:push-gateway@localhost".into());
+        match WebPushSender::new(pem, subject) {
+            Ok(s) => {
+                tracing::warn!("Web Push (VAPID) sender enabled");
+                senders.push(Box::new(s));
+            }
+            Err(e) => tracing::error!(error = %e, "Web Push sender init failed; echo-only"),
+        }
+    }
+    // Dev echo sender (logs, delivers nothing) — fallback / no-VAPID case.
+    senders.push(Box::new(EchoSender));
 
     let state = AppState {
         store: Arc::new(Store::new()),

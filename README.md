@@ -27,9 +27,11 @@ The gateway's control plane is the **`push/*` Trust Task family**
 `TrustTask` documents (canonical `trust-tasks-rs` envelope), so the same
 documents ride the **DIDComm binding (preferred) or HTTPS (fallback)**.
 
-Implemented: the **HTTPS** transport + in-memory stores + a dev **echo sender**
-(logs the wake, delivers nothing) — enough to exercise register → provision →
-wake end-to-end with no Apple/Google account. Not production-ready.
+Implemented: both transports (HTTPS + DIDComm) + in-memory stores + two
+senders — a real **Web Push (VAPID)** sender (`GATEWAY_VAPID_KEY_FILE`,
+self-hostable, no Apple/Google account) and a dev **echo sender** (logs,
+delivers nothing) as the fallback. Not yet production-hardened (in-memory
+state; APNs/FCM senders pending).
 
 **DIDComm transport (preferred)** is wired: when `GATEWAY_IDENTITY_FILE`
 provides the gateway's provisioned `did:webvh` identity, a `DIDCommService`
@@ -39,8 +41,8 @@ Identity is provisioned like any integration: `pnm bootstrap
 provision-integration --template push-gateway --var URL=<gateway-didcomm-url>`,
 then open the bundle into the identity file.
 
-Roadmap: Web Push (VAPID) sender · APNs · FCM · persistent store · metrics ·
-networked-resolver tuning for `did:webvh` senders.
+Roadmap: APNs · FCM senders · persistent store · metrics · networked-resolver
+tuning for `did:webvh` senders.
 
 ## API
 
@@ -98,6 +100,9 @@ cargo run
 # GATEWAY_ADDR=https://gw.example   handle gateway field when HTTPS-only (no identity)
 # GATEWAY_IDENTITY_FILE=./gateway-identity.json   provisioned did:webvh identity →
 #                       enables the DIDComm transport; handles advertise the DID
+# GATEWAY_VAPID_KEY_FILE=./vapid.pem   VAPID private key (PEM) → enables the
+#                       Web Push sender. Generate: openssl ecparam -genkey -name prime256v1
+# GATEWAY_VAPID_SUBJECT=mailto:ops@example.com   VAPID contact (sub claim)
 # RUST_LOG=vti_push_gateway=debug
 ```
 

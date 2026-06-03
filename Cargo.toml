@@ -42,6 +42,7 @@ affinidi-did-resolver-cache-sdk = { version = "0.8", features = ["network"] }
 tokio-util = "0.7"
 # Async push senders (real delivery — Web Push / APNs — is async HTTP).
 async-trait = "0.1"
+web-push = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -135,7 +135,7 @@ impl PushSender for WebPushSender {
         match self.client.send(message).await {
             Ok(()) => SendOutcome::Delivered,
             // 404/410 — the subscription is gone; drop the handle (binding §3.2).
-            Err(WebPushError::EndpointNotValid | WebPushError::EndpointNotFound) => {
+            Err(WebPushError::EndpointNotValid(_) | WebPushError::EndpointNotFound(_)) => {
                 SendOutcome::PermanentlyUnregistered
             }
             Err(e) => {

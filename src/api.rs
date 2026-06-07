@@ -24,7 +24,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rand::RngCore;
+use rand::Rng;
 use serde::Serialize;
 use serde_json::{json, Value};
 use trust_tasks_rs::{RejectReason, TrustTask};
@@ -34,10 +34,6 @@ use crate::auth::{self, HEADER_DID, HEADER_SIG};
 use crate::sender::{self, PushSender, SendOutcome};
 use crate::store::{ProvisionOutcome, Store, WakeAuthz};
 use crate::types::{ProvisionRequest, RegisterRequest, WakePayload, WakeRequest};
-
-pub(crate) const PUSH_REGISTER: &str = "https://trusttasks.org/spec/push/register/0.1";
-pub(crate) const PUSH_PROVISION: &str = "https://trusttasks.org/spec/push/provision/0.1";
-pub(crate) const PUSH_WAKE: &str = "https://trusttasks.org/spec/push/wake/0.1";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -61,7 +57,7 @@ fn new_id() -> String {
 /// Issue a fresh opaque handle (32 bytes of CSPRNG, base58btc).
 fn new_handle() -> String {
     let mut b = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut b);
+    rand::rng().fill_bytes(&mut b);
     bs58::encode(b).into_string()
 }
 
@@ -108,14 +104,19 @@ pub(crate) async fn dispatch_push(
     sender: Option<String>,
     doc: &TrustTask<Value>,
 ) -> Value {
-    match doc.type_uri.to_string().as_str() {
-        PUSH_REGISTER => handle_register(state, doc).await,
-        PUSH_PROVISION => handle_provision(state, sender, doc).await,
-        PUSH_WAKE => handle_wake(state, sender, doc).await,
-        other => reject_value(
+    let uri = &doc.type_uri;
+    match (uri.slug(), uri.major(), uri.minor()) {
+        // `push/register` accepts both 0.1 and 0.2. The payload schemas are
+        // field-identical — 0.2 is the Trust-Tasks lowerCamelCase migration, a
+        // version-string bump for this no-enum payload — and `respond_with`
+        // mirrors the request version into the `#response`. See issue #7.
+        ("push/register", 0, 1 | 2) => handle_register(state, doc).await,
+        ("push/provision", 0, 1) => handle_provision(state, sender, doc).await,
+        ("push/wake", 0, 1) => handle_wake(state, sender, doc).await,
+        _ => reject_value(
             doc,
             RejectReason::UnsupportedType {
-                type_uri: other.to_string(),
+                type_uri: uri.to_string(),
             },
         ),
     }

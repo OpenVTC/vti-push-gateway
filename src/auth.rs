@@ -72,7 +72,16 @@ pub fn verify_signed(did: &str, sig_b64url: &str, body: &[u8]) -> Result<(), Aut
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use rand::rngs::OsRng;
+    use rand::Rng;
+
+    /// Generate a signing key from OS randomness. (ed25519-dalek's own
+    /// `generate` is tied to rand_core 0.6; we seed `from_bytes` from rand 0.10
+    /// instead to keep a single rand version in the tree.)
+    fn signing_key() -> SigningKey {
+        let mut seed = [0u8; 32];
+        rand::rng().fill_bytes(&mut seed);
+        SigningKey::from_bytes(&seed)
+    }
 
     /// Build the `did:key` for a signing key (multicodec-tagged, base58btc).
     fn did_key_for(sk: &SigningKey) -> String {
@@ -83,7 +92,7 @@ mod tests {
 
     #[test]
     fn round_trip_verifies() {
-        let sk = SigningKey::generate(&mut OsRng);
+        let sk = signing_key();
         let did = did_key_for(&sk);
         let body = br#"{"handle":"h","v":1}"#;
         let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.sign(body).to_bytes());

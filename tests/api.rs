@@ -9,7 +9,7 @@ use axum::http::{Request, StatusCode};
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use http_body_util::BodyExt;
-use rand::rngs::OsRng;
+use rand::Rng;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
@@ -19,8 +19,17 @@ use vti_push_gateway::store::Store;
 
 const ED25519_MULTICODEC: [u8; 2] = [0xed, 0x01];
 const PUSH_REGISTER: &str = "https://trusttasks.org/spec/push/register/0.1";
+const PUSH_REGISTER_V2: &str = "https://trusttasks.org/spec/push/register/0.2";
 const PUSH_PROVISION: &str = "https://trusttasks.org/spec/push/provision/0.1";
 const PUSH_WAKE: &str = "https://trusttasks.org/spec/push/wake/0.1";
+
+/// Generate a signing key from OS randomness (rand 0.10), avoiding
+/// ed25519-dalek's rand_core-0.6-tied `generate`.
+fn signing_key() -> SigningKey {
+    let mut seed = [0u8; 32];
+    rand::rng().fill_bytes(&mut seed);
+    SigningKey::from_bytes(&seed)
+}
 
 fn did_key_for(sk: &SigningKey) -> String {
     let mut bytes = ED25519_MULTICODEC.to_vec();
@@ -75,8 +84,8 @@ fn is_success(doc: &Value) -> bool {
 
 #[tokio::test]
 async fn full_flow_register_provision_wake() {
-    let vta = SigningKey::generate(&mut OsRng);
-    let mediator = SigningKey::generate(&mut OsRng);
+    let vta = signing_key();
+    let mediator = signing_key();
     let app = router(state());
 
     // 1. Device registers (unauthenticated) → opaque handle.
@@ -111,7 +120,7 @@ async fn full_flow_register_provision_wake() {
     );
 
     // 3. A non-controller cannot provision.
-    let imposter = SigningKey::generate(&mut OsRng);
+    let imposter = signing_key();
     let prov = tt_doc(
         PUSH_PROVISION,
         json!({ "handle": handle, "policy": { "allowedTriggers": [did_key_for(&imposter)] } }),
@@ -168,9 +177,37 @@ async fn full_flow_register_provision_wake() {
     );
 }
 
+/// Issue #7: a `push/register/0.2` document is accepted (payload-identical to
+/// 0.1) and the success response mirrors the request version.
+#[tokio::test]
+async fn register_v2_returns_v2_response() {
+    let vta = signing_key();
+    let app = router(state());
+    let reg = tt_doc(
+        PUSH_REGISTER_V2,
+        json!({
+            "registration": { "platform": "apns", "token": "abc", "topic": "org.openvtc.app" },
+            "controllerVtaDid": did_key_for(&vta),
+        }),
+    );
+    let resp = app.oneshot(post(&reg, None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc = body_json(resp).await;
+    assert!(is_success(&doc), "register/0.2 should succeed: {doc}");
+    assert_eq!(
+        doc["type"], "https://trusttasks.org/spec/push/register/0.2#response",
+        "response must mirror the request's 0.2 version: {doc}"
+    );
+    assert!(
+        doc["payload"]["wakeHandle"]["handle"].is_string()
+            && doc["payload"]["wakeHandle"]["gateway"].is_string(),
+        "0.2 response carries wakeHandle {{gateway, handle}}: {doc}"
+    );
+}
+
 #[tokio::test]
 async fn wake_unknown_handle_is_rejected() {
-    let trigger = SigningKey::generate(&mut OsRng);
+    let trigger = signing_key();
     let app = router(state());
     let wake = tt_doc(PUSH_WAKE, json!({ "handle": "nope", "v": 1 }));
     let doc = body_json(app.oneshot(post(&wake, Some(&trigger))).await.unwrap()).await;
@@ -194,7 +231,7 @@ async fn provision_without_auth_is_rejected() {
 
 #[tokio::test]
 async fn bad_signature_is_401() {
-    let trigger = SigningKey::generate(&mut OsRng);
+    let trigger = signing_key();
     let app = router(state());
     let wake = tt_doc(PUSH_WAKE, json!({ "handle": "h", "v": 1 }));
     let mut req = post(&wake, Some(&trigger));

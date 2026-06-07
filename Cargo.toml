@@ -42,7 +42,15 @@ affinidi-did-resolver-cache-sdk = { version = "0.8", features = ["network"] }
 tokio-util = "0.7"
 # Async push senders (real delivery — Web Push / APNs — is async HTTP).
 async-trait = "0.1"
-web-push = "0.11"
+# Web Push (RFC 8030/8291) payload encryption only — the `vapid` feature is
+# deliberately disabled: it pulls jwt-simple's pure-rust backend (superboring →
+# rsa), and rsa carries the unfixable Marvin-Attack advisory (RUSTSEC-2023-0071).
+# VAPID (ES256 JWT, RFC 8292) is signed directly with `p256` instead, so the
+# `rsa` crate never enters the tree. Delivery is a plain `reqwest` POST.
+web-push-native = { version = "0.4", default-features = false }
+p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+http = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

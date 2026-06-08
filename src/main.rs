@@ -63,7 +63,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_else(|_| "mailto:push-gateway@localhost".into());
         match WebPushSender::new(pem, subject) {
             Ok(s) => {
-                tracing::warn!("Web Push (VAPID) sender enabled");
+                // Surface the public key so the operator can paste it into the
+                // device/plugin config (`pushGatewayVapidPublicKey`) — no need to
+                // re-derive it from the PEM.
+                tracing::warn!(
+                    vapid_public = %s.vapid_public(),
+                    "Web Push (VAPID) sender enabled — set this as the device/plugin applicationServerKey"
+                );
                 senders.push(Box::new(s));
             }
             Err(e) => tracing::error!(error = %e, "Web Push sender init failed; echo fallback"),

@@ -93,17 +93,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // APNs sender — enabled when the app publisher's auth key + ids are set.
     if let Ok(p8_path) = std::env::var("GATEWAY_APNS_KEY_FILE") {
         let p8 = std::fs::read(&p8_path)?;
-        let key_id = std::env::var("GATEWAY_APNS_KEY_ID").unwrap_or_default();
-        let team_id = std::env::var("GATEWAY_APNS_TEAM_ID").unwrap_or_default();
+        // Trim: a stray newline/space (common when exporting env vars) in the
+        // key id or team id silently breaks the JWT → APNs 403 InvalidProviderToken.
+        let key_id = std::env::var("GATEWAY_APNS_KEY_ID")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let team_id = std::env::var("GATEWAY_APNS_TEAM_ID")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         if key_id.is_empty() || team_id.is_empty() {
             tracing::error!(
                 "GATEWAY_APNS_KEY_FILE set but GATEWAY_APNS_KEY_ID / GATEWAY_APNS_TEAM_ID \
                  missing; APNs disabled (echo fallback for apns)"
             );
         } else {
-            match ApnsSender::new(p8, key_id, team_id) {
+            // Key ID + Team ID are non-secret identifiers (the JWT `kid` / `iss`);
+            // log them so an operator can verify them against the Apple portal —
+            // a mismatch is the usual cause of `InvalidProviderToken`.
+            match ApnsSender::new(p8, key_id.clone(), team_id.clone()) {
                 Ok(s) => {
-                    tracing::warn!("APNs sender enabled");
+                    tracing::warn!(
+                        key_id = %key_id, team_id = %team_id,
+                        "APNs sender enabled (verify these match the Apple Developer portal)"
+                    );
                     senders.push(Box::new(s));
                 }
                 Err(e) => tracing::error!(error = %e, "APNs sender init failed; echo fallback"),

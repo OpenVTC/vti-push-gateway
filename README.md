@@ -177,6 +177,18 @@ Prove a contentless push reaches the browser and wakes the service worker.
    The service-worker console then shows `[pnm push] push received: …` followed
    by the inbound drain (`startInboundListener`).
 
+   **iOS (APNs)** is the same, with `test-wake-apns`. Run the gateway with the
+   APNs credentials (`GATEWAY_APNS_KEY_FILE` / `_KEY_ID` / `_TEAM_ID`), copy the
+   device's APNs token from the app (it's shown in the UI + logged), then:
+
+   ```sh
+   cargo run -- test-wake-apns http://127.0.0.1:8300 <apns-token-hex> org.openvtc.vta.agent
+   ```
+
+   No VTA, no `did:webvh` gateway identity, no hand-signing — the helper plays a
+   real did-signed trigger. The phone wakes, drains its mediator, and ratifies.
+   (Uses the **sandbox** APNs host, matching a development build's token.)
+
 ### 5b. Full path — VTA-triggered
 
 1. **Connect the plugin to your VTA.** On connect the service worker subscribes,

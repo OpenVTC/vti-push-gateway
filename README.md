@@ -34,8 +34,9 @@ self-hostable, no Apple/Google account), a real **APNs** sender
 background push), a real **FCM** sender (`GATEWAY_FCM_SERVICE_ACCOUNT_FILE`;
 FCM HTTP v1, OAuth2 access token from an RS256 service-account assertion signed
 with `aws-lc-rs` — no `rsa` crate; data-only high-priority wake), and a dev
-**echo sender** (logs, delivers nothing) as the fallback. Not yet
-production-hardened (in-memory state).
+**echo sender** (logs, delivers nothing) as the fallback. The handle registry
+is in-memory by default, or **durable** via a JSON snapshot when
+`GATEWAY_STORE_FILE` is set (handles/tokens survive a restart).
 
 **DIDComm transport (preferred)** is wired: when `GATEWAY_IDENTITY_FILE`
 provides the gateway's provisioned `did:webvh` identity, a `DIDCommService`
@@ -45,8 +46,7 @@ Identity is provisioned like any integration: `pnm bootstrap
 provision-integration --template push-gateway --var URL=<gateway-didcomm-url>`,
 then open the bundle into the identity file.
 
-Roadmap: persistent store · metrics · networked-resolver tuning for
-`did:webvh` senders.
+Roadmap: metrics · networked-resolver tuning for `did:webvh` senders.
 
 ## API
 
@@ -113,6 +113,8 @@ cargo run
 # GATEWAY_APNS_TEAM_ID=DEF456GHIJ   the Apple Developer Team ID (JWT `iss`)
 # GATEWAY_FCM_SERVICE_ACCOUNT_FILE=./service-account.json   Google service
 #                       account (Firebase) → enables the FCM sender
+# GATEWAY_STORE_FILE=./gateway-store.json   persist the handle registry to this
+#                       JSON snapshot (survives restart). Omit = in-memory.
 # RUST_LOG=vti_push_gateway=debug
 ```
 

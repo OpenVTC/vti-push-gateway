@@ -29,11 +29,14 @@ use vti_push_gateway::store::Store;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // `vapid-keygen [path]` — mint a fresh VAPID keypair (no openssl) and exit.
-    // Handled before anything else so its output isn't interleaved with logs.
+    // Dev subcommands — handled before anything else so their output isn't
+    // interleaved with server logs.
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("vapid-keygen") {
         return vapid_keygen(args.get(2).map(String::as_str));
+    }
+    if args.get(1).map(String::as_str) == Some("test-wake") {
+        return test_wake(&args).await;
     }
 
     tracing_subscriber::fmt()
@@ -177,5 +180,142 @@ fn vapid_keygen(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     println!("Next:");
     println!("  • run the gateway:  GATEWAY_VAPID_KEY_FILE={path} cargo run");
     println!("  • plugin Settings:  paste the public key as 'Push gateway VAPID public key'");
+    Ok(())
+}
+
+/// `test-wake <gateway-url> <subscription.json> [mediator-did]` — fire a real
+/// contentless wake at a registered subscription, end to end, with no VTA in the
+/// loop. Acts as a **legitimate did-signed trigger** (not a backdoor): it mints a
+/// throwaway `did:key`, `push/register`s the subscription under that DID (so it's
+/// the controller), `push/provision`s itself onto the allowlist, then sends a
+/// signed `push/wake`. The gateway runs its normal auth + allowlist + delivery.
+///
+/// `subscription.json` is the extension service-worker's logged subscription —
+/// `{ "endpoint": …, "keys": { "p256dh": …, "auth": … } }` (copy the
+/// `[pnm push] subscription:` line). Use it to prove: wake → gateway → Web Push
+/// → the browser SW wakes and drains.
+async fn test_wake(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let usage = "usage: test-wake <gateway-url> <subscription.json> [mediator-did]";
+    let gateway = args.get(2).ok_or(usage)?;
+    let sub_path = args.get(3).ok_or(usage)?;
+    let mediator = args.get(4).cloned();
+
+    let sub_raw = std::fs::read_to_string(sub_path).map_err(|e| {
+        format!(
+            "can't read subscription file '{sub_path}': {e}\n  \
+             Save the extension service-worker's `[pnm push] subscription:` JSON \
+             (its `{{endpoint, keys}}` object) to this path first."
+        )
+    })?;
+    let sub: serde_json::Value = serde_json::from_str(&sub_raw)
+        .map_err(|e| format!("'{sub_path}' is not valid JSON: {e}"))?;
+    let endpoint = sub["endpoint"]
+        .as_str()
+        .ok_or("subscription.endpoint missing")?;
+    let p256dh = sub["keys"]["p256dh"]
+        .as_str()
+        .ok_or("subscription.keys.p256dh missing")?;
+    let auth = sub["keys"]["auth"]
+        .as_str()
+        .ok_or("subscription.keys.auth missing")?;
+
+    // A throwaway did:key acting as both controller VTA (to provision) and
+    // trigger (to wake) — a real signed caller.
+    let mut seed = [0u8; 32];
+    {
+        use rand::Rng;
+        rand::rng().fill_bytes(&mut seed);
+    }
+    let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let did = {
+        let mut b = vec![0xed, 0x01];
+        b.extend_from_slice(sk.verifying_key().as_bytes());
+        format!("did:key:z{}", bs58::encode(b).into_string())
+    };
+
+    let base = gateway.trim_end_matches('/');
+    let client = reqwest::Client::new();
+    let url = format!("{base}/trust-tasks");
+
+    // POST a Trust Task doc; sign the exact body bytes when `signed` (the gateway
+    // verifies the X-TT-Signature over the raw body).
+    async fn post(
+        client: &reqwest::Client,
+        url: &str,
+        doc: &serde_json::Value,
+        signer: Option<(&str, &ed25519_dalek::SigningKey)>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        use base64::Engine;
+        use ed25519_dalek::Signer;
+        let body = serde_json::to_vec(doc)?;
+        let mut req = client.post(url).header("content-type", "application/json");
+        if let Some((did, sk)) = signer {
+            let sig =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.sign(&body).to_bytes());
+            req = req.header("x-tt-did", did).header("x-tt-signature", sig);
+        }
+        let resp = req.body(body).send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(format!("{url} → {status}: {text}").into());
+        }
+        let v: serde_json::Value = serde_json::from_str(&text)?;
+        if v.get("type")
+            .and_then(|t| t.as_str())
+            .is_some_and(|t| t.contains("trust-task-error"))
+        {
+            return Err(format!("gateway rejected: {v}").into());
+        }
+        Ok(v)
+    }
+
+    // 1. register (unauthenticated) → opaque handle.
+    let reg = serde_json::json!({
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "type": "https://trusttasks.org/spec/push/register/0.2",
+        "payload": {
+            "registration": { "platform": "webpush", "endpoint": endpoint,
+                              "keys": { "p256dh": p256dh, "auth": auth } },
+            "controllerVtaDid": did,
+        }
+    });
+    let handle = post(&client, &url, &reg, None)
+        .await?
+        .pointer("/payload/wakeHandle/handle")
+        .and_then(|v| v.as_str())
+        .ok_or("register: no handle in response")?
+        .to_string();
+    println!("1/3 registered → handle {handle}");
+
+    // 2. provision (signed; we are the controller) → allowlist = [self].
+    let prov = serde_json::json!({
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "type": "https://trusttasks.org/spec/push/provision/0.1",
+        "payload": { "handle": handle, "policy": { "allowedTriggers": [did] } }
+    });
+    post(&client, &url, &prov, Some((&did, &sk))).await?;
+    println!("2/3 provisioned → allowlist [self]");
+
+    // 3. wake (signed; we are on the allowlist) → contentless push.
+    let mut wake_payload =
+        serde_json::json!({ "handle": handle, "v": 1, "urgency": "interactive" });
+    if let Some(m) = &mediator {
+        wake_payload["mediator"] = serde_json::json!(m);
+    }
+    let wake = serde_json::json!({
+        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+        "type": "https://trusttasks.org/spec/push/wake/0.1",
+        "payload": wake_payload
+    });
+    let resp = post(&client, &url, &wake, Some((&did, &sk))).await?;
+    let status = resp
+        .pointer("/payload/status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("(see below)");
+    println!("3/3 wake → {status}");
+    println!("\nIf delivered, the extension service-worker console shows:");
+    println!("  [pnm push] push received: …");
+    println!("\nfull wake response: {resp}");
     Ok(())
 }

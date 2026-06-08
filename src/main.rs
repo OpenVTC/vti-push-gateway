@@ -200,7 +200,15 @@ async fn test_wake(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let sub_path = args.get(3).ok_or(usage)?;
     let mediator = args.get(4).cloned();
 
-    let sub: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(sub_path)?)?;
+    let sub_raw = std::fs::read_to_string(sub_path).map_err(|e| {
+        format!(
+            "can't read subscription file '{sub_path}': {e}\n  \
+             Save the extension service-worker's `[pnm push] subscription:` JSON \
+             (its `{{endpoint, keys}}` object) to this path first."
+        )
+    })?;
+    let sub: serde_json::Value = serde_json::from_str(&sub_raw)
+        .map_err(|e| format!("'{sub_path}' is not valid JSON: {e}"))?;
     let endpoint = sub["endpoint"]
         .as_str()
         .ok_or("subscription.endpoint missing")?;

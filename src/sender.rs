@@ -3,11 +3,15 @@
 //! One async trait, pluggable per platform:
 //! - [`WebPushSender`] — real Web Push (VAPID), self-hostable (no Apple/Google
 //!   account). Handles `webpush`.
+//! - [`ApnsSender`] — real APNs (Apple Push Notification service) via the
+//!   provider-token (JWT) API. Handles `apns`. Needs the app publisher's APNs
+//!   auth key (`.p8`) + key id + team id.
 //! - [`EchoSender`] — dev: logs the wake, delivers nothing. Handles every
-//!   platform, so it's the fallback (apns/fcm, or webpush with no VAPID key).
+//!   platform, so it's the fallback (fcm, or apns/webpush with no credentials).
 //!
-//! APNs/FCM senders drop in behind the same trait once credentials exist.
+//! The FCM sender drops in behind the same trait once credentials exist.
 
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -18,7 +22,7 @@ use p256::pkcs8::DecodePrivateKey;
 use p256::SecretKey;
 use web_push_native::{Auth, WebPushBuilder};
 
-use crate::types::{PushRegistration, WakePayload};
+use crate::types::{ApnsEnvironment, PushRegistration, WakePayload};
 
 /// base64url, no padding — the encoding used throughout Web Push / VAPID.
 fn b64url(bytes: &[u8]) -> String {
@@ -226,6 +230,186 @@ impl PushSender for WebPushSender {
     }
 }
 
+/// A cached APNs provider token (JWT) and the unix second it was issued.
+struct CachedToken {
+    jwt: String,
+    iat: u64,
+}
+
+/// APNs requires a *fresh* provider token at least hourly and refuses tokens
+/// regenerated more than once per ~20 minutes (`TooManyProviderTokenUpdates`).
+/// 40 minutes sits safely inside that window, so we cache and reuse.
+const APNS_TOKEN_REFRESH_SECS: u64 = 40 * 60;
+
+/// APNs error response body — `{"reason":"BadDeviceToken"}`.
+#[derive(serde::Deserialize)]
+struct ApnsError {
+    #[serde(default)]
+    reason: String,
+}
+
+/// Real APNs sender via the **provider-token (JWT) API** (no per-connection
+/// client certificate). The app publisher's APNs auth key (`.p8`, a P-256
+/// PKCS#8 key) signs a short-lived ES256 JWT — cached and reused per
+/// [`APNS_TOKEN_REFRESH_SECS`] — that authorises HTTP/2 pushes to Apple.
+///
+/// Delivers the contentless [`WakePayload`] as a **silent background push**
+/// (`aps.content-available = 1`, `apns-push-type: background`, priority 5); the
+/// hint fields ride as custom keys, never task content (binding §2). The device
+/// wakes and drains its mediator. Handles only `apns` registrations.
+pub struct ApnsSender {
+    /// Apple Developer team id — the JWT `iss` claim.
+    team_id: String,
+    /// APNs auth key id — the JWT header `kid`.
+    key_id: String,
+    /// The `.p8` signing key (P-256).
+    signing_key: SigningKey,
+    client: reqwest::Client,
+    /// Cached provider token, refreshed on a timer (see [`APNS_TOKEN_REFRESH_SECS`]).
+    token: Mutex<Option<CachedToken>>,
+}
+
+impl ApnsSender {
+    /// Build a sender from the APNs auth key (`.p8`, P-256 PKCS#8 PEM), its key
+    /// id, and the Apple Developer team id.
+    pub fn new(p8_pem: Vec<u8>, key_id: String, team_id: String) -> Result<Self, String> {
+        let pem = std::str::from_utf8(&p8_pem).map_err(|e| format!("APNs .p8 not utf-8: {e}"))?;
+        let secret = SecretKey::from_pkcs8_pem(pem)
+            .map_err(|e| format!("parse APNs key (expected P-256 PKCS#8 .p8 PEM): {e}"))?;
+        let signing_key = SigningKey::from(&secret);
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("APNs client init: {e}"))?;
+        Ok(Self {
+            team_id,
+            key_id,
+            signing_key,
+            client,
+            token: Mutex::new(None),
+        })
+    }
+
+    /// The current APNs provider token (JWT), regenerating it when the cached
+    /// one is missing or older than [`APNS_TOKEN_REFRESH_SECS`]. The header
+    /// carries `kid`; the claims carry `iss` (team id) + `iat`, per Apple's
+    /// token-based connection docs.
+    fn provider_token(&self) -> Option<String> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        let mut guard = self.token.lock().ok()?;
+        if let Some(t) = guard.as_ref() {
+            if now.saturating_sub(t.iat) < APNS_TOKEN_REFRESH_SECS {
+                return Some(t.jwt.clone());
+            }
+        }
+        let header = b64url(
+            &serde_json::to_vec(&serde_json::json!({
+                "alg": "ES256",
+                "kid": self.key_id,
+                "typ": "JWT",
+            }))
+            .ok()?,
+        );
+        let claims = b64url(
+            &serde_json::to_vec(&serde_json::json!({
+                "iss": self.team_id,
+                "iat": now,
+            }))
+            .ok()?,
+        );
+        let signing_input = format!("{header}.{claims}");
+        let sig: Signature = self.signing_key.sign(signing_input.as_bytes());
+        let jwt = format!("{signing_input}.{}", b64url(&sig.to_bytes()));
+        *guard = Some(CachedToken {
+            jwt: jwt.clone(),
+            iat: now,
+        });
+        Some(jwt)
+    }
+}
+
+#[async_trait]
+impl PushSender for ApnsSender {
+    fn handles(&self, registration: &PushRegistration) -> bool {
+        matches!(registration, PushRegistration::Apns { .. })
+    }
+
+    async fn send(&self, registration: &PushRegistration, payload: &WakePayload) -> SendOutcome {
+        let PushRegistration::Apns {
+            token,
+            topic,
+            environment,
+        } = registration
+        else {
+            return SendOutcome::TransientFailure; // not ours (select() shouldn't route here)
+        };
+        // Sandbox vs production is the only difference in host; default to
+        // production when the device didn't say.
+        let host = match environment {
+            Some(ApnsEnvironment::Sandbox) => "api.sandbox.push.apple.com",
+            Some(ApnsEnvironment::Production) | None => "api.push.apple.com",
+        };
+        let url = format!("https://{host}/3/device/{token}");
+
+        let Some(jwt) = self.provider_token() else {
+            tracing::warn!("APNs provider token build failed");
+            return SendOutcome::TransientFailure;
+        };
+
+        // Contentless background push (binding §2): the `aps` content-available
+        // flag wakes the app; the WakePayload hint fields ride as custom keys —
+        // never task content.
+        let mut body = match serde_json::to_value(payload) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => serde_json::Map::new(),
+        };
+        body.insert(
+            "aps".to_string(),
+            serde_json::json!({ "content-available": 1 }),
+        );
+
+        let resp = self
+            .client
+            .post(&url)
+            .header(AUTHORIZATION, format!("bearer {jwt}"))
+            .header("apns-topic", topic)
+            .header("apns-push-type", "background")
+            // Background (content-available) pushes MUST be priority 5.
+            .header("apns-priority", "5")
+            .json(&body)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => SendOutcome::Delivered,
+            Ok(r) => {
+                let status = r.status();
+                let reason = r
+                    .json::<ApnsError>()
+                    .await
+                    .map(|e| e.reason)
+                    .unwrap_or_default();
+                // 410 Unregistered, or a 400 naming a dead/mismatched token →
+                // drop the handle (binding §3.2). Everything else is transient.
+                if status == reqwest::StatusCode::GONE
+                    || matches!(
+                        reason.as_str(),
+                        "Unregistered" | "BadDeviceToken" | "DeviceTokenNotForTopic"
+                    )
+                {
+                    SendOutcome::PermanentlyUnregistered
+                } else {
+                    tracing::warn!(%status, reason, "APNs rejected the wake");
+                    SendOutcome::TransientFailure
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "APNs send failed");
+                SendOutcome::TransientFailure
+            }
+        }
+    }
+}
+
 /// Pick the first sender that handles the registration's platform.
 pub fn select<'a>(
     senders: &'a [Box<dyn PushSender>],
@@ -329,5 +513,71 @@ IEi5IEIIVCOOhTviiI9vnxIg8awULr5vD3yBD1uHnzlkoCihDa7mzLS+
         // …and apns falls through to the echo sender (only it handles apns here).
         let s = select(&senders, &apns()).expect("echo handles apns");
         assert!(s.handles(&apns()));
+    }
+
+    // The APNs `.p8` auth key is the same shape as a VAPID key (P-256 PKCS#8),
+    // so the test key doubles as a stand-in auth key.
+    const TEST_APNS_P8: &[u8] = TEST_VAPID_PEM;
+
+    #[test]
+    fn apns_sender_handles_only_apns() {
+        let s =
+            ApnsSender::new(TEST_APNS_P8.to_vec(), "KEYID123".into(), "TEAMID456".into()).unwrap();
+        assert!(s.handles(&apns()));
+        assert!(!s.handles(&webpush()));
+    }
+
+    /// The provider token must be a well-formed ES256 JWT carrying `kid` in the
+    /// header and `iss`/`iat` in the claims, signed by the auth key — and it
+    /// must be **cached** (a second call returns the same token).
+    #[test]
+    fn apns_provider_token_is_a_valid_es256_jwt_and_is_cached() {
+        use p256::ecdsa::signature::Verifier;
+
+        let s =
+            ApnsSender::new(TEST_APNS_P8.to_vec(), "KEYID123".into(), "TEAMID456".into()).unwrap();
+        let jwt = s.provider_token().expect("token built");
+        assert_eq!(
+            s.provider_token().as_deref(),
+            Some(jwt.as_str()),
+            "token is cached"
+        );
+
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT is header.claims.signature");
+
+        let hdr: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(hdr["alg"], "ES256");
+        assert_eq!(hdr["kid"], "KEYID123");
+
+        let claims: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(claims["iss"], "TEAMID456");
+        assert!(claims["iat"].is_u64(), "iat present");
+
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let sig = Signature::from_slice(&b64url_decode(parts[2]).unwrap()).unwrap();
+        s.signing_key
+            .verifying_key()
+            .verify(signing_input.as_bytes(), &sig)
+            .expect("APNs provider-token signature verifies");
+    }
+
+    #[test]
+    fn select_routes_apns_to_the_apns_sender() {
+        let senders: Vec<Box<dyn PushSender>> = vec![
+            Box::new(WebPushSender::new(TEST_VAPID_PEM.to_vec(), "mailto:x@y".into()).unwrap()),
+            Box::new(
+                ApnsSender::new(TEST_APNS_P8.to_vec(), "KEYID123".into(), "TEAMID456".into())
+                    .unwrap(),
+            ),
+            Box::new(EchoSender),
+        ];
+        // apns now resolves to the real APNs sender, not the echo fallback.
+        let s = select(&senders, &apns()).expect("a sender handles apns");
+        assert!(s.handles(&apns()));
+        // And it is NOT the webpush sender.
+        assert!(!s.handles(&webpush()));
     }
 }

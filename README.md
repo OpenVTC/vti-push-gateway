@@ -27,11 +27,12 @@ The gateway's control plane is the **`push/*` Trust Task family**
 `TrustTask` documents (canonical `trust-tasks-rs` envelope), so the same
 documents ride the **DIDComm binding (preferred) or HTTPS (fallback)**.
 
-Implemented: both transports (HTTPS + DIDComm) + in-memory stores + two
+Implemented: both transports (HTTPS + DIDComm) + in-memory stores + three
 senders — a real **Web Push (VAPID)** sender (`GATEWAY_VAPID_KEY_FILE`,
-self-hostable, no Apple/Google account) and a dev **echo sender** (logs,
-delivers nothing) as the fallback. Not yet production-hardened (in-memory
-state; APNs/FCM senders pending).
+self-hostable, no Apple/Google account), a real **APNs** sender
+(`GATEWAY_APNS_KEY_FILE` + key id + team id; provider-token JWT API, contentless
+background push), and a dev **echo sender** (logs, delivers nothing) as the
+fallback. Not yet production-hardened (in-memory state; FCM sender pending).
 
 **DIDComm transport (preferred)** is wired: when `GATEWAY_IDENTITY_FILE`
 provides the gateway's provisioned `did:webvh` identity, a `DIDCommService`
@@ -41,8 +42,8 @@ Identity is provisioned like any integration: `pnm bootstrap
 provision-integration --template push-gateway --var URL=<gateway-didcomm-url>`,
 then open the bundle into the identity file.
 
-Roadmap: APNs · FCM senders · persistent store · metrics · networked-resolver
-tuning for `did:webvh` senders.
+Roadmap: FCM sender · persistent store · metrics · networked-resolver tuning for
+`did:webvh` senders.
 
 ## API
 
@@ -103,6 +104,10 @@ cargo run
 # GATEWAY_VAPID_KEY_FILE=./vapid.pem   VAPID private key (PEM) → enables the
 #                       Web Push sender. Generate: openssl ecparam -genkey -name prime256v1
 # GATEWAY_VAPID_SUBJECT=mailto:ops@example.com   VAPID contact (sub claim)
+# GATEWAY_APNS_KEY_FILE=./AuthKey.p8   APNs auth key (.p8, P-256 PKCS#8) →
+#                       enables the APNs sender (requires the two ids below)
+# GATEWAY_APNS_KEY_ID=ABC123DEFG    the auth key's Key ID (JWT `kid`)
+# GATEWAY_APNS_TEAM_ID=DEF456GHIJ   the Apple Developer Team ID (JWT `iss`)
 # RUST_LOG=vti_push_gateway=debug
 ```
 

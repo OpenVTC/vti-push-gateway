@@ -11,7 +11,8 @@
 //! - **HTTPS** — `POST /trust-tasks`, did-signed, for callers that can't speak
 //!   DIDComm.
 //!
-//! Push *delivery* is still the dev `EchoSender` (Web Push / APNs / FCM follow).
+//! Push *delivery* is real for Web Push (VAPID) and APNs when their credentials
+//! are configured; the dev `EchoSender` is the fallback (and FCM follows).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use vti_push_gateway::api::{self, AppState};
 use vti_push_gateway::didcomm;
 use vti_push_gateway::identity::GatewayIdentity;
-use vti_push_gateway::sender::{EchoSender, PushSender, WebPushSender};
+use vti_push_gateway::sender::{ApnsSender, EchoSender, PushSender, WebPushSender};
 use vti_push_gateway::store::Store;
 
 #[tokio::main]
@@ -51,9 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Senders are tried in order (first that `handles` the platform wins). The
-    // Web Push (VAPID) sender — enabled by GATEWAY_VAPID_KEY_FILE — handles
-    // `webpush` for real; the echo sender (handles every platform) is the
-    // fallback for apns/fcm (dev) and for webpush when no VAPID key is set.
+    // Web Push (VAPID) sender handles `webpush` and the APNs sender handles
+    // `apns` — each enabled only when its credentials are configured; the echo
+    // sender (handles every platform) is the fallback for anything left (fcm,
+    // or apns/webpush with no credentials).
     let mut senders: Vec<Box<dyn PushSender>> = Vec::new();
     if let Ok(pem_path) = std::env::var("GATEWAY_VAPID_KEY_FILE") {
         let pem = std::fs::read(&pem_path)?;
@@ -64,10 +66,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!("Web Push (VAPID) sender enabled");
                 senders.push(Box::new(s));
             }
-            Err(e) => tracing::error!(error = %e, "Web Push sender init failed; echo-only"),
+            Err(e) => tracing::error!(error = %e, "Web Push sender init failed; echo fallback"),
         }
     }
-    // Dev echo sender (logs, delivers nothing) — fallback / no-VAPID case.
+    // APNs sender — enabled when the app publisher's auth key + ids are set.
+    if let Ok(p8_path) = std::env::var("GATEWAY_APNS_KEY_FILE") {
+        let p8 = std::fs::read(&p8_path)?;
+        let key_id = std::env::var("GATEWAY_APNS_KEY_ID").unwrap_or_default();
+        let team_id = std::env::var("GATEWAY_APNS_TEAM_ID").unwrap_or_default();
+        if key_id.is_empty() || team_id.is_empty() {
+            tracing::error!(
+                "GATEWAY_APNS_KEY_FILE set but GATEWAY_APNS_KEY_ID / GATEWAY_APNS_TEAM_ID \
+                 missing; APNs disabled (echo fallback for apns)"
+            );
+        } else {
+            match ApnsSender::new(p8, key_id, team_id) {
+                Ok(s) => {
+                    tracing::warn!("APNs sender enabled");
+                    senders.push(Box::new(s));
+                }
+                Err(e) => tracing::error!(error = %e, "APNs sender init failed; echo fallback"),
+            }
+        }
+    }
+    // Dev echo sender (logs, delivers nothing) — fallback / no-credentials case.
     senders.push(Box::new(EchoSender));
 
     let state = AppState {
@@ -100,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::warn!(
         %bind, %gateway_addr,
-        "vti-push-gateway up (echo sender — no real pushes are delivered)"
+        "vti-push-gateway up"
     );
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

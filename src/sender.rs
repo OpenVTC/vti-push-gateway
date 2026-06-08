@@ -6,23 +6,36 @@
 //! - [`ApnsSender`] — real APNs (Apple Push Notification service) via the
 //!   provider-token (JWT) API. Handles `apns`. Needs the app publisher's APNs
 //!   auth key (`.p8`) + key id + team id.
+//! - [`FcmSender`] — real FCM (Firebase Cloud Messaging) via the HTTP v1 API.
+//!   Handles `fcm`. Needs a Google service-account JSON; the OAuth2 assertion is
+//!   signed RS256 with `aws-lc-rs` (no `rsa` crate).
 //! - [`EchoSender`] — dev: logs the wake, delivers nothing. Handles every
-//!   platform, so it's the fallback (fcm, or apns/webpush with no credentials).
-//!
-//! The FCM sender drops in behind the same trait once credentials exist.
+//!   platform, so it's the fallback (any platform with no credentials).
 
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine;
-use http::{header::AUTHORIZATION, HeaderValue, Uri};
+use http::{
+    header::{AUTHORIZATION, CONTENT_TYPE},
+    HeaderValue, Uri,
+};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use p256::pkcs8::DecodePrivateKey;
 use p256::SecretKey;
 use web_push_native::{Auth, WebPushBuilder};
 
-use crate::types::{ApnsEnvironment, PushRegistration, WakePayload};
+use crate::types::{ApnsEnvironment, PushRegistration, Urgency, WakePayload};
+
+/// Decode a PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----` … base64 … `-----END …`)
+/// into DER bytes — used for the FCM service-account RSA signing key.
+fn pem_to_der(pem: &str) -> Result<Vec<u8>, String> {
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .map_err(|e| format!("decode PKCS#8 PEM base64: {e}"))
+}
 
 /// base64url, no padding — the encoding used throughout Web Push / VAPID.
 fn b64url(bytes: &[u8]) -> String {
@@ -447,6 +460,226 @@ impl PushSender for ApnsSender {
     }
 }
 
+// ── FCM (Firebase Cloud Messaging) ──────────────────────────────────────────
+
+/// Refresh the OAuth2 access token a little before its ~1h expiry.
+const FCM_TOKEN_REFRESH_SECS: u64 = 50 * 60;
+/// OAuth2 scope for sending via FCM HTTP v1.
+const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
+
+/// The fields the gateway needs from a Google service-account JSON.
+#[derive(serde::Deserialize)]
+struct ServiceAccount {
+    project_id: String,
+    client_email: String,
+    /// RSA private key, PKCS#8 PEM.
+    private_key: String,
+    token_uri: String,
+}
+
+/// OAuth2 token-endpoint response (the bits we use).
+#[derive(serde::Deserialize)]
+struct FcmTokenResponse {
+    access_token: String,
+    expires_in: u64,
+}
+
+/// A cached OAuth2 access token + when it was obtained and its lifetime.
+struct CachedAccessToken {
+    token: String,
+    obtained_at: u64,
+    ttl: u64,
+}
+
+/// Real FCM (Firebase Cloud Messaging) sender via the **HTTP v1** API.
+///
+/// Authorises with a short-lived OAuth2 **access token**, obtained by signing a
+/// service-account assertion JWT (**RS256**, via `aws-lc-rs` — so the vulnerable
+/// `rsa` crate never enters the tree, matching the VAPID/APNs senders) and
+/// exchanging it at the account's `token_uri`. The token is cached + reused (see
+/// [`FCM_TOKEN_REFRESH_SECS`]).
+///
+/// Delivers the contentless [`WakePayload`] as a **data-only, high-priority**
+/// message (no `notification`): FCM `data` values MUST be strings, so the hint
+/// fields are stringified; `android.priority: high` wakes a backgrounded app.
+/// The device drains its mediator on receipt. Handles only `fcm` registrations.
+pub struct FcmSender {
+    project_id: String,
+    client_email: String,
+    token_uri: String,
+    signing_key: aws_lc_rs::signature::RsaKeyPair,
+    client: reqwest::Client,
+    token: tokio::sync::Mutex<Option<CachedAccessToken>>,
+}
+
+impl FcmSender {
+    /// Build a sender from a Google service-account JSON (`project_id`,
+    /// `client_email`, `private_key` (RSA PKCS#8 PEM), `token_uri`).
+    pub fn new(service_account_json: &[u8]) -> Result<Self, String> {
+        let sa: ServiceAccount = serde_json::from_slice(service_account_json)
+            .map_err(|e| format!("parse FCM service-account JSON: {e}"))?;
+        let der = pem_to_der(&sa.private_key)?;
+        let signing_key = aws_lc_rs::signature::RsaKeyPair::from_pkcs8(&der)
+            .map_err(|e| format!("parse FCM service-account key (expected RSA PKCS#8): {e}"))?;
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("FCM client init: {e}"))?;
+        Ok(Self {
+            project_id: sa.project_id,
+            client_email: sa.client_email,
+            token_uri: sa.token_uri,
+            signing_key,
+            client,
+            token: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    /// Mint the service-account assertion JWT (RS256) for the OAuth2 exchange.
+    fn assertion_jwt(&self, now: u64) -> Option<String> {
+        let header = b64url(br#"{"alg":"RS256","typ":"JWT"}"#);
+        let claims = b64url(
+            &serde_json::to_vec(&serde_json::json!({
+                "iss": self.client_email,
+                "scope": FCM_SCOPE,
+                "aud": self.token_uri,
+                "iat": now,
+                "exp": now + 3600,
+            }))
+            .ok()?,
+        );
+        let signing_input = format!("{header}.{claims}");
+        let mut sig = vec![0u8; self.signing_key.public_modulus_len()];
+        self.signing_key
+            .sign(
+                &aws_lc_rs::signature::RSA_PKCS1_SHA256,
+                &aws_lc_rs::rand::SystemRandom::new(),
+                signing_input.as_bytes(),
+                &mut sig,
+            )
+            .ok()?;
+        Some(format!("{signing_input}.{}", b64url(&sig)))
+    }
+
+    /// A valid OAuth2 access token, exchanging a fresh assertion when the cache
+    /// is empty or near expiry.
+    async fn access_token(&self) -> Option<String> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+        let mut guard = self.token.lock().await;
+        if let Some(t) = guard.as_ref() {
+            if now.saturating_sub(t.obtained_at) < t.ttl.min(FCM_TOKEN_REFRESH_SECS) {
+                return Some(t.token.clone());
+            }
+        }
+        let assertion = self.assertion_jwt(now)?;
+        // application/x-www-form-urlencoded by hand: the assertion is base64url
+        // (URL-safe alphabet, no padding), so only the grant_type's `:` need
+        // percent-encoding. Avoids pulling reqwest's `urlencoded` form helper.
+        let form_body = format!(
+            "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={assertion}"
+        );
+        let resp = self
+            .client
+            .post(&self.token_uri)
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(form_body)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(%status, body, "FCM OAuth2 token exchange failed");
+            return None;
+        }
+        let tok: FcmTokenResponse = resp.json().await.ok()?;
+        let token = tok.access_token.clone();
+        *guard = Some(CachedAccessToken {
+            token: tok.access_token,
+            obtained_at: now,
+            ttl: tok.expires_in,
+        });
+        Some(token)
+    }
+}
+
+#[async_trait]
+impl PushSender for FcmSender {
+    fn handles(&self, registration: &PushRegistration) -> bool {
+        matches!(registration, PushRegistration::Fcm { .. })
+    }
+
+    async fn send(&self, registration: &PushRegistration, payload: &WakePayload) -> SendOutcome {
+        let PushRegistration::Fcm { token } = registration else {
+            return SendOutcome::TransientFailure; // not ours (select() shouldn't route here)
+        };
+        let Some(access) = self.access_token().await else {
+            return SendOutcome::TransientFailure;
+        };
+
+        // FCM `data` values MUST be strings — stringify the contentless hint
+        // fields (binding §2: no task content, no handle, no task type).
+        let mut data = serde_json::Map::new();
+        data.insert("v".to_string(), payload.v.to_string().into());
+        if let Some(m) = &payload.mediator {
+            data.insert("mediator".to_string(), m.clone().into());
+        }
+        if let Some(c) = payload.count {
+            data.insert("count".to_string(), c.to_string().into());
+        }
+        if let Some(u) = payload.urgency {
+            let s = match u {
+                Urgency::Interactive => "interactive",
+                Urgency::Background => "background",
+            };
+            data.insert("urgency".to_string(), s.into());
+        }
+
+        let url = format!(
+            "https://fcm.googleapis.com/v1/projects/{}/messages:send",
+            self.project_id
+        );
+        let body = serde_json::json!({
+            "message": {
+                "token": token,
+                "data": data,
+                // High priority so a backgrounded app is woken now (the doorbell).
+                "android": { "priority": "high" },
+            }
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header(AUTHORIZATION, format!("Bearer {access}"))
+            .json(&body)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => SendOutcome::Delivered,
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                // A dead token → UNREGISTERED / NOT_FOUND; drop the handle
+                // (binding §3.2). Everything else is transient.
+                if status == reqwest::StatusCode::NOT_FOUND
+                    || body.contains("UNREGISTERED")
+                    || body.contains("registration-token-not-registered")
+                {
+                    SendOutcome::PermanentlyUnregistered
+                } else {
+                    tracing::warn!(%status, body, "FCM rejected the wake");
+                    SendOutcome::TransientFailure
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "FCM send failed");
+                SendOutcome::TransientFailure
+            }
+        }
+    }
+}
+
 /// Pick the first sender that handles the registration's platform.
 pub fn select<'a>(
     senders: &'a [Box<dyn PushSender>],
@@ -628,5 +861,98 @@ IEi5IEIIVCOOhTviiI9vnxIg8awULr5vD3yBD1uHnzlkoCihDa7mzLS+
         assert!(s.handles(&apns()));
         // And it is NOT the webpush sender.
         assert!(!s.handles(&webpush()));
+    }
+
+    // A throwaway RSA-2048 PKCS#8 key (PEM) standing in for a Google
+    // service-account `private_key`. Not used to sign anything verified outside
+    // this test; the matching public key is derived from it in-test.
+    const TEST_RSA_PKCS8_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQD03iRySoK1K/lT
+v68JHs2dOHMMXy4u01pau7UzZVTV3RL3bMitU66WfdGZsm2fWjNV+kgpeS2RaM9A
+ZgOACqdL7p0ClgkfV1UsIWN2F6F4NJKBDcg9J4SRXq/XNiHuUM2FyHmYVEWwZJTZ
+1wGb4i8sEw7U6ibKRsetN2WMK+qW11cUwngeWYk7J5Fan1fRoAqXHP34HGlvNIkK
+yxcyGdghsPW+ZHISH/C719vHX1exesolWQrDAv9XGyrOB3JVFh449VTKx75gOTD8
+rIHlO94hfnadsky4XcPqRUVPEEjefehpOKDbCT8hrEKlREcbuFb7ps0PZeWmUwgT
+hWJcrkGBAgMBAAECggEAEDHzCiYYcAAZDOt0Ga/SXJAjt9FBvjIXW0Hn8Z7FliF5
+hCjLOv96YBSxPK+a5XuzQn/7rtaHZ4Mdlf5JQ/owZ2rAMrAWqV5+0RziNajJcqhT
+ejqdoEHRWEYBbkPzyY3JkgwY0rTcKRb161R3lEZI5WrbQ8S6zQ0SXsf3rOYorVIu
+now8eTRTioOch6r46mDpvX/4WeKQSZ8roolMJErfL+Uh/vjtj1QUayXJF0IkBA0T
+KnNu6U3wY0a3cT9V0rLzsdrJEPko/lT3nSlRLChrQkuP2cMJvlo3baghkbVJt+Ms
+Yvoml+rxHN9wIlBZXKW/U6C7uDXD+jPlgEWcrBG++QKBgQD9yYSY8sYjVGl1ASq2
+8XC4mpwVMISkRfakKWJNZ7UhTQedh9YsSixyBwfzfC4lopLLSREeDRzzEPapXAdh
+WNrkCr96h2XMQPWqwWmImeySxrkHhjWMkmw1xh1hflrejnxyy0VzH6+oHnyottqK
+TAa9Uwsc3uUJTGGllDpoROVrFQKBgQD3ALcX309vELJLwknsINZWeulHZ2rBZlfG
+9DHZ2ZJAXjmqp/UYjgEI7NlX0+8tvEZGDphYKHTRDXemkTomEWsDj3wrXkWChtvv
+PAEDMDmQl0oxy/v/SnmlEHwoGWvUYDHfkEZrxXoSV8Ihm+9w+ib0vPN90FLINqHC
+KoicQ4YnvQKBgC6YzojKooigGhDKmw4l/H1YneniE6iZ0/RGSO9PaFlp7EkHRNKy
+98Aj/Fi/ZzWvyOYcT1FGNReH+NIVvKEqEF6ofom/zHgZQUIN6xOSt3YnmJeCE9jw
+lX+2FXTuHz8XyE/HdMPzgGwM1PShRjT4SpB+a97sKf9wD8m4EpVMeRcVAoGAF7e8
+3RD3Wq3awQWN/ZuFmVZCEjYu/RUrtpH6O3X14jJqDSYFle8E0GuVzyYtoFGk2dNK
+86Qm23AUnizxzXf8s6HShYOO3yK9+bHkUv8NeAHfAPsaXoAzQBNeKKeQQBtgjpwW
+9wBGYX6FyJ5llo6esP93zgvz9v+v9qoI5iBhwG0CgYEAurpvo07Z9fzq7aZowf4n
+rFNMT5gxftH4vPEF3dxuqzlxAcdkCLinQafjmXcB0b1OEgAmYKV2ks4h8M5dt9/B
+fNmjDHN/ElPNZSWT5KOXiBOUYkvON0g7reIWwFzToqKjE9HtLpYiShDsLCxAkMFo
+JIdgVjmcJ6J16mUbDYosCYI=
+-----END PRIVATE KEY-----"#;
+
+    fn fcm_service_account_json() -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "project_id": "demo-project",
+            "client_email": "pusher@demo-project.iam.gserviceaccount.com",
+            "private_key": TEST_RSA_PKCS8_PEM,
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn fcm_sender_handles_only_fcm() {
+        let s = FcmSender::new(&fcm_service_account_json()).expect("FcmSender::new");
+        let fcm = PushRegistration::Fcm {
+            token: "device-token".into(),
+        };
+        assert!(s.handles(&fcm));
+        assert!(!s.handles(&apns()));
+        assert!(!s.handles(&webpush()));
+    }
+
+    /// The OAuth2 assertion is a well-formed RS256 JWT carrying the
+    /// service-account claims, and its signature verifies under the
+    /// service-account public key — proving the aws-lc-rs RS256 path works.
+    #[test]
+    fn fcm_assertion_is_a_valid_rs256_jwt() {
+        use aws_lc_rs::signature::{KeyPair, UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
+
+        let s = FcmSender::new(&fcm_service_account_json()).expect("FcmSender::new");
+        let now = 1_700_000_000;
+        let jwt = s.assertion_jwt(now).expect("assertion minted");
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT has header.claims.signature");
+
+        let hdr: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(hdr["alg"], "RS256");
+        assert_eq!(hdr["typ"], "JWT");
+
+        let claims: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(claims["iss"], "pusher@demo-project.iam.gserviceaccount.com");
+        assert_eq!(claims["scope"], FCM_SCOPE);
+        assert_eq!(claims["aud"], "https://oauth2.googleapis.com/token");
+        assert_eq!(claims["iat"], now);
+        assert_eq!(claims["exp"], now + 3600);
+
+        // Verify the RS256 signature under the service-account public key.
+        let der = pem_to_der(TEST_RSA_PKCS8_PEM).unwrap();
+        let kp = aws_lc_rs::signature::RsaKeyPair::from_pkcs8(&der).unwrap();
+        let public = UnparsedPublicKey::new(
+            &RSA_PKCS1_2048_8192_SHA256,
+            kp.public_key().as_ref().to_vec(),
+        );
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+        let sig = b64url_decode(parts[2]).unwrap();
+        public
+            .verify(signing_input.as_bytes(), &sig)
+            .expect("RS256 assertion signature verifies");
     }
 }

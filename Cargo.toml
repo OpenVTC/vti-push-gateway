@@ -49,7 +49,11 @@ async-trait = "0.1"
 # `rsa` crate never enters the tree. Delivery is a plain `reqwest` POST.
 web-push-native = { version = "0.4", default-features = false }
 p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+# `http2` is REQUIRED: Apple's APNs provider API is HTTP/2-only, and reqwest
+# gates HTTP/2 behind this feature (off when `default-features = false`). Without
+# it, APNs sends fail as a transient push-service error. Web Push tolerates
+# HTTP/1.1, but APNs does not.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 http = "1"
 
 [dev-dependencies]

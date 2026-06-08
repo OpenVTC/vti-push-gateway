@@ -22,11 +22,20 @@ use tokio_util::sync::CancellationToken;
 use vti_push_gateway::api::{self, AppState};
 use vti_push_gateway::didcomm;
 use vti_push_gateway::identity::GatewayIdentity;
-use vti_push_gateway::sender::{ApnsSender, EchoSender, PushSender, WebPushSender};
+use vti_push_gateway::sender::{
+    generate_vapid_keypair, ApnsSender, EchoSender, PushSender, WebPushSender,
+};
 use vti_push_gateway::store::Store;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // `vapid-keygen [path]` — mint a fresh VAPID keypair (no openssl) and exit.
+    // Handled before anything else so its output isn't interleaved with logs.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("vapid-keygen") {
+        return vapid_keygen(args.get(2).map(String::as_str));
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -141,4 +150,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
     tracing::info!("shutting down");
+}
+
+/// Mint a fresh VAPID keypair and write the private key (PKCS#8 PEM) to `path`
+/// (default `vapid.pem`), printing the public key the device/plugin registers.
+/// Refuses to overwrite an existing file — a clobbered key invalidates every
+/// live subscription.
+fn vapid_keygen(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+    let path = path.unwrap_or("vapid.pem");
+    if Path::new(path).exists() {
+        return Err(format!("{path} already exists — refusing to overwrite a VAPID key").into());
+    }
+    let (pem, public) = generate_vapid_keypair()?;
+    std::fs::write(path, &pem)?;
+    // It's a private key — lock it down on unix.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    println!("Wrote VAPID private key (PKCS#8 PEM): {path}");
+    println!();
+    println!("VAPID public key (applicationServerKey):");
+    println!("  {public}");
+    println!();
+    println!("Next:");
+    println!("  • run the gateway:  GATEWAY_VAPID_KEY_FILE={path} cargo run");
+    println!("  • plugin Settings:  paste the public key as 'Push gateway VAPID public key'");
+    Ok(())
 }

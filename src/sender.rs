@@ -129,6 +129,13 @@ impl WebPushSender {
         })
     }
 
+    /// The VAPID **public** key (base64url, uncompressed P-256 point) subscribers
+    /// register as their `applicationServerKey`. Surfaced so an operator can copy
+    /// it into the device/plugin config without re-deriving it from the PEM.
+    pub fn vapid_public(&self) -> &str {
+        &self.vapid_public
+    }
+
     /// Build the `Authorization: vapid t=<JWT>, k=<pubkey>` header value for a
     /// request to `endpoint` (RFC 8292 §3, aes128gcm single-header form). The
     /// JWT `aud` is the endpoint's origin.

@@ -115,6 +115,56 @@ With `GATEWAY_IDENTITY_FILE` set the gateway connects to the mediator named in
 the identity and serves `push/*` over DIDComm (preferred) as well as HTTPS;
 without it, HTTPS-only. See `src/identity.rs` for the identity file shape.
 
+## Testing Web Push end-to-end
+
+The wake loop spans the gateway, a VTA + mediator, and the browser plugin. A
+**local** gateway is enough — it only makes *outbound* calls to the push service.
+
+1. **VAPID keypair** — the gateway's own signing key (no Apple/Google account):
+
+   ```sh
+   openssl ecparam -genkey -name prime256v1 -noout -out vapid.pem
+   ```
+
+2. **Run the gateway** with the key. On startup it logs the matching VAPID
+   **public** key — copy it (this is the value the plugin needs; you don't have
+   to derive it from the PEM):
+
+   ```sh
+   GATEWAY_VAPID_KEY_FILE=./vapid.pem RUST_LOG=vti_push_gateway=info cargo run
+   #  WARN … vapid_public="BPx…"  Web Push (VAPID) sender enabled — set this as
+   #        the device/plugin applicationServerKey
+   ```
+
+   For the **DIDComm** transport (preferred) also provision a gateway identity
+   and set `GATEWAY_IDENTITY_FILE` (see above). For an HTTPS-only smoke test,
+   omit it and set `GATEWAY_ADDR=http://127.0.0.1:8300`.
+
+3. **Configure the plugin** (extension → Settings):
+   - *Push gateway URL* → the gateway's address (its DID if DIDComm, else the URL).
+   - *Push gateway VAPID public key* → the `vapid_public` value from step 2.
+
+4. **Connect the plugin to your VTA.** On connect the service worker subscribes
+   to Web Push, `push/register`s with the gateway (logs the `WakeHandle`), and
+   conveys it to the VTA via `device/set-wake` — the VTA provisions the gateway's
+   allowlist.
+
+5. **Fire a wake.** Trigger anything that queues a DIDComm message for the
+   wallet (e.g. an RP confirm-request, or a VTA step-up it delegates), or send a
+   signed `push/wake` directly (see the HTTPS example above). The gateway
+   delivers a contentless push; the extension's service worker wakes, drains its
+   mediator, and runs the consent → response flow. Watch the extension's
+   service-worker console:
+
+   ```
+   [pnm push] push received: …
+   ```
+
+   followed by the inbound drain.
+
+The push is contentless by design — it only wakes the app; the real (encrypted)
+Trust Task is pulled from the mediator.
+
 ## Security notes
 
 - The platform push token is held by the gateway alone, behind the opaque handle

@@ -23,7 +23,7 @@ use vti_push_gateway::api::{self, AppState};
 use vti_push_gateway::didcomm;
 use vti_push_gateway::identity::GatewayIdentity;
 use vti_push_gateway::sender::{
-    generate_vapid_keypair, ApnsSender, EchoSender, PushSender, WebPushSender,
+    generate_vapid_keypair, ApnsSender, EchoSender, FcmSender, PushSender, WebPushSender,
 };
 use vti_push_gateway::store::Store;
 
@@ -40,6 +40,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.get(1).map(String::as_str) == Some("test-wake-apns") {
         return test_wake_apns(&args).await;
+    }
+    if args.get(1).map(String::as_str) == Some("test-wake-fcm") {
+        return test_wake_fcm(&args).await;
     }
 
     tracing_subscriber::fmt()
@@ -122,6 +125,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => tracing::error!(error = %e, "APNs sender init failed; echo fallback"),
             }
+        }
+    }
+    // FCM sender — enabled when a Google service-account JSON is configured.
+    if let Ok(sa_path) = std::env::var("GATEWAY_FCM_SERVICE_ACCOUNT_FILE") {
+        let sa = std::fs::read(&sa_path)?;
+        match FcmSender::new(&sa) {
+            Ok(s) => {
+                tracing::warn!("FCM (Firebase Cloud Messaging) sender enabled");
+                senders.push(Box::new(s));
+            }
+            Err(e) => tracing::error!(error = %e, "FCM sender init failed; echo fallback"),
         }
     }
     // Dev echo sender (logs, delivers nothing) — fallback / no-credentials case.
@@ -365,5 +379,19 @@ async fn test_wake_apns(args: &[String]) -> Result<(), Box<dyn std::error::Error
     let registration = serde_json::json!({
         "platform": "apns", "token": token, "topic": topic, "environment": "sandbox"
     });
+    fire_wake(gateway, registration, mediator).await
+}
+
+/// `test-wake-fcm <gateway-url> <fcm-registration-token> [mediator-did]`
+/// — fire a wake at a registered **FCM** device token, end to end, with no VTA.
+/// The token is the Android app's FCM registration token. Requires the gateway
+/// to have been started with `GATEWAY_FCM_SERVICE_ACCOUNT_FILE` set.
+async fn test_wake_fcm(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let usage = "usage: test-wake-fcm <gateway-url> <fcm-registration-token> [mediator-did]";
+    let gateway = args.get(2).ok_or(usage)?;
+    let token = args.get(3).ok_or(usage)?;
+    let mediator = args.get(4).cloned();
+
+    let registration = serde_json::json!({ "platform": "fcm", "token": token });
     fire_wake(gateway, registration, mediator).await
 }

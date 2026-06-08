@@ -55,6 +55,11 @@ p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 # HTTP/1.1, but APNs does not.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 http = "1"
+# FCM HTTP v1 authorises with an OAuth2 access token, obtained by signing a
+# service-account assertion JWT with RS256. We sign with `aws-lc-rs` (already in
+# the tree via rustls) so the vulnerable `rsa` crate (Marvin Attack,
+# RUSTSEC-2023-0071) never enters — same "no rsa" stance as VAPID/APNs above.
+aws-lc-rs = "1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

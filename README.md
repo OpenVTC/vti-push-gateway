@@ -27,12 +27,15 @@ The gateway's control plane is the **`push/*` Trust Task family**
 `TrustTask` documents (canonical `trust-tasks-rs` envelope), so the same
 documents ride the **DIDComm binding (preferred) or HTTPS (fallback)**.
 
-Implemented: both transports (HTTPS + DIDComm) + in-memory stores + three
+Implemented: both transports (HTTPS + DIDComm) + in-memory stores + four
 senders — a real **Web Push (VAPID)** sender (`GATEWAY_VAPID_KEY_FILE`,
 self-hostable, no Apple/Google account), a real **APNs** sender
 (`GATEWAY_APNS_KEY_FILE` + key id + team id; provider-token JWT API, contentless
-background push), and a dev **echo sender** (logs, delivers nothing) as the
-fallback. Not yet production-hardened (in-memory state; FCM sender pending).
+background push), a real **FCM** sender (`GATEWAY_FCM_SERVICE_ACCOUNT_FILE`;
+FCM HTTP v1, OAuth2 access token from an RS256 service-account assertion signed
+with `aws-lc-rs` — no `rsa` crate; data-only high-priority wake), and a dev
+**echo sender** (logs, delivers nothing) as the fallback. Not yet
+production-hardened (in-memory state).
 
 **DIDComm transport (preferred)** is wired: when `GATEWAY_IDENTITY_FILE`
 provides the gateway's provisioned `did:webvh` identity, a `DIDCommService`
@@ -42,7 +45,7 @@ Identity is provisioned like any integration: `pnm bootstrap
 provision-integration --template push-gateway --var URL=<gateway-didcomm-url>`,
 then open the bundle into the identity file.
 
-Roadmap: FCM sender · persistent store · metrics · networked-resolver tuning for
+Roadmap: persistent store · metrics · networked-resolver tuning for
 `did:webvh` senders.
 
 ## API
@@ -108,6 +111,8 @@ cargo run
 #                       enables the APNs sender (requires the two ids below)
 # GATEWAY_APNS_KEY_ID=ABC123DEFG    the auth key's Key ID (JWT `kid`)
 # GATEWAY_APNS_TEAM_ID=DEF456GHIJ   the Apple Developer Team ID (JWT `iss`)
+# GATEWAY_FCM_SERVICE_ACCOUNT_FILE=./service-account.json   Google service
+#                       account (Firebase) → enables the FCM sender
 # RUST_LOG=vti_push_gateway=debug
 ```
 
@@ -183,6 +188,14 @@ Prove a contentless push reaches the browser and wakes the service worker.
 
    ```sh
    cargo run -- test-wake-apns http://127.0.0.1:8300 <apns-token-hex> org.openvtc.vta.agent
+   ```
+
+   **Android (FCM)** is the same, with `test-wake-fcm`. Run the gateway with
+   `GATEWAY_FCM_SERVICE_ACCOUNT_FILE` set, copy the device's FCM registration
+   token, then:
+
+   ```sh
+   cargo run -- test-wake-fcm http://127.0.0.1:8300 <fcm-registration-token>
    ```
 
    No VTA, no `did:webvh` gateway identity, no hand-signing — the helper plays a

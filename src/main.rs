@@ -141,8 +141,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Dev echo sender (logs, delivers nothing) — fallback / no-credentials case.
     senders.push(Box::new(EchoSender));
 
+    // Durable store when GATEWAY_STORE_FILE is set (handles/tokens survive a
+    // restart); in-memory otherwise.
+    let store = match std::env::var("GATEWAY_STORE_FILE") {
+        Ok(path) => Store::open(path.into()),
+        Err(_) => {
+            tracing::warn!(
+                "GATEWAY_STORE_FILE not set — handle registry is in-memory and lost on restart"
+            );
+            Store::new()
+        }
+    };
     let state = AppState {
-        store: Arc::new(Store::new()),
+        store: Arc::new(store),
         senders: Arc::new(senders),
         gateway_addr: gateway_addr.clone(),
     };

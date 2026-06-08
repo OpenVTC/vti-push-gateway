@@ -142,26 +142,52 @@ The wake loop spans the gateway, a VTA + mediator, and the browser plugin. A
    omit it and set `GATEWAY_ADDR=http://127.0.0.1:8300`.
 
 3. **Configure the plugin** (extension → Settings):
-   - *Push gateway URL* → the gateway's address (its DID if DIDComm, else the URL).
-   - *Push gateway VAPID public key* → the `vapid_public` value from step 2.
+   - *Push gateway VAPID public key* → the value from step 1/2. (This alone makes
+     the service worker subscribe with the gateway's key.)
+   - *Push gateway URL* → the gateway's address — needed for the full VTA path
+     (step 5b); optional for the quick check (5a).
 
-4. **Connect the plugin to your VTA.** On connect the service worker subscribes
-   to Web Push, `push/register`s with the gateway (logs the `WakeHandle`), and
-   conveys it to the VTA via `device/set-wake` — the VTA provisions the gateway's
-   allowlist.
+### 5a. Quick check — delivery + wake, no VTA
 
-5. **Fire a wake.** Trigger anything that queues a DIDComm message for the
-   wallet (e.g. an RP confirm-request, or a VTA step-up it delegates), or send a
-   signed `push/wake` directly (see the HTTPS example above). The gateway
-   delivers a contentless push; the extension's service worker wakes, drains its
-   mediator, and runs the consent → response flow. Watch the extension's
-   service-worker console:
+Prove a contentless push reaches the browser and wakes the service worker.
+
+1. Open the extension's **service worker** console (`chrome://extensions` → VTA
+   Wallet → *service worker*) and copy the logged subscription:
 
    ```
-   [pnm push] push received: …
+   [pnm push] subscription:
+   {"endpoint":"https://…","keys":{"p256dh":"…","auth":"…"}}
    ```
 
-   followed by the inbound drain.
+   Save it to `sub.json`. (If you don't see it, reload the extension — the SW
+   subscribes on spin-up once the VAPID key is set.)
+
+2. Fire a real, did-signed wake at it with the bundled helper — it mints a
+   throwaway `did:key`, registers the subscription, provisions itself onto the
+   allowlist, and sends `push/wake`, so the gateway runs its normal auth +
+   delivery (no VTA, no hand-signing):
+
+   ```sh
+   cargo run -- test-wake http://127.0.0.1:8300 ./sub.json
+   #  1/3 registered → handle …
+   #  2/3 provisioned → allowlist [self]
+   #  3/3 wake → delivered
+   ```
+
+   The service-worker console then shows `[pnm push] push received: …` followed
+   by the inbound drain (`startInboundListener`).
+
+### 5b. Full path — VTA-triggered
+
+1. **Connect the plugin to your VTA.** On connect the service worker subscribes,
+   `push/register`s with the gateway (logs the `WakeHandle`), and conveys it to
+   the VTA via `device/set-wake` — the VTA provisions the gateway's allowlist.
+   (Reload the extension after connecting if `set-wake` hasn't run yet — it fires
+   on the next SW spin-up.)
+2. **Trigger** anything that queues a DIDComm message for the wallet (e.g. a VTA
+   step-up it delegates to this device). The VTA buffers the message to the
+   mediator and asks the gateway to wake the device; the gateway delivers the
+   contentless push and the wallet wakes + drains as in 5a.
 
 The push is contentless by design — it only wakes the app; the real (encrypted)
 Trust Task is pulled from the mediator.

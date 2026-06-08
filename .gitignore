@@ -6,3 +6,4 @@ Cargo.lock.bak
 *.pem
 service-account*.json
 .env
+sub.json

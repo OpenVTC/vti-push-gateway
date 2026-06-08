@@ -36,6 +36,36 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// Generate a fresh VAPID (P-256) keypair, so an operator never needs `openssl`.
+/// Returns the private key as a **PKCS#8 PEM** (what `GATEWAY_VAPID_KEY_FILE`
+/// loads) and the public key as **base64url** (the `applicationServerKey` the
+/// device/plugin registers). The two are a matched pair.
+pub fn generate_vapid_keypair() -> Result<(String, String), String> {
+    use p256::pkcs8::{EncodePrivateKey, LineEnding};
+    use rand::Rng;
+
+    // A P-256 scalar must be in [1, n-1]; random 32-byte values are valid with
+    // overwhelming probability — reject and retry the negligibly-rare miss.
+    let secret = loop {
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        if let Ok(sk) = SecretKey::from_slice(&bytes) {
+            break sk;
+        }
+    };
+    let pem = secret
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|e| format!("encode VAPID key as PKCS#8 PEM: {e}"))?
+        .to_string();
+    let public = b64url(
+        SigningKey::from(&secret)
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes(),
+    );
+    Ok((pem, public))
+}
+
 /// Result of a push send. `PermanentlyUnregistered` triggers the binding §3.2
 /// dead-token rule (the gateway drops the handle).
 #[derive(Debug, PartialEq, Eq)]
@@ -525,6 +555,18 @@ IEi5IEIIVCOOhTviiI9vnxIg8awULr5vD3yBD1uHnzlkoCihDa7mzLS+
     // The APNs `.p8` auth key is the same shape as a VAPID key (P-256 PKCS#8),
     // so the test key doubles as a stand-in auth key.
     const TEST_APNS_P8: &[u8] = TEST_VAPID_PEM;
+
+    #[test]
+    fn generated_vapid_keypair_round_trips_through_the_sender() {
+        let (pem, public) = generate_vapid_keypair().unwrap();
+        // The generated PEM loads as a Web Push sender, and the public key we
+        // returned matches what the sender advertises — a matched pair.
+        let s = WebPushSender::new(pem.into_bytes(), "mailto:ops@gw".into()).unwrap();
+        assert_eq!(s.vapid_public(), public);
+        // Distinct each time (it's random).
+        let (_, public2) = generate_vapid_keypair().unwrap();
+        assert_ne!(public, public2);
+    }
 
     #[test]
     fn apns_sender_handles_only_apns() {

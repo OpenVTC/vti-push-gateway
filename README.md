@@ -102,7 +102,7 @@ cargo run
 # GATEWAY_IDENTITY_FILE=./gateway-identity.json   provisioned did:webvh identity →
 #                       enables the DIDComm transport; handles advertise the DID
 # GATEWAY_VAPID_KEY_FILE=./vapid.pem   VAPID private key (PEM) → enables the
-#                       Web Push sender. Generate: openssl ecparam -genkey -name prime256v1
+#                       Web Push sender. Generate with: cargo run -- vapid-keygen
 # GATEWAY_VAPID_SUBJECT=mailto:ops@example.com   VAPID contact (sub claim)
 # GATEWAY_APNS_KEY_FILE=./AuthKey.p8   APNs auth key (.p8, P-256 PKCS#8) →
 #                       enables the APNs sender (requires the two ids below)
@@ -120,19 +120,20 @@ without it, HTTPS-only. See `src/identity.rs` for the identity file shape.
 The wake loop spans the gateway, a VTA + mediator, and the browser plugin. A
 **local** gateway is enough — it only makes *outbound* calls to the push service.
 
-1. **VAPID keypair** — the gateway's own signing key (no Apple/Google account):
+1. **VAPID keypair** — let the gateway mint it (no openssl, no Apple/Google
+   account). It writes the private key to `vapid.pem` (0600) and prints the
+   public key the plugin needs:
 
    ```sh
-   openssl ecparam -genkey -name prime256v1 -noout -out vapid.pem
+   cargo run -- vapid-keygen            # → vapid.pem + the public key on stdout
    ```
 
-2. **Run the gateway** with the key. On startup it logs the matching VAPID
-   **public** key — copy it (this is the value the plugin needs; you don't have
-   to derive it from the PEM):
+2. **Run the gateway** with the key (it also re-logs the public key on startup,
+   so you can recover it any time):
 
    ```sh
    GATEWAY_VAPID_KEY_FILE=./vapid.pem RUST_LOG=vti_push_gateway=info cargo run
-   #  WARN … vapid_public="BPx…"  Web Push (VAPID) sender enabled — set this as
+   #  WARN … vapid_public="BOae…"  Web Push (VAPID) sender enabled — set this as
    #        the device/plugin applicationServerKey
    ```
 

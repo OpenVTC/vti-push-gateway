@@ -38,6 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.get(1).map(String::as_str) == Some("test-wake") {
         return test_wake(&args).await;
     }
+    if args.get(1).map(String::as_str) == Some("test-wake-apns") {
+        return test_wake_apns(&args).await;
+    }
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -194,33 +197,18 @@ fn vapid_keygen(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
 /// `{ "endpoint": …, "keys": { "p256dh": …, "auth": … } }` (copy the
 /// `[pnm push] subscription:` line). Use it to prove: wake → gateway → Web Push
 /// → the browser SW wakes and drains.
-async fn test_wake(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let usage = "usage: test-wake <gateway-url> <subscription.json> [mediator-did]";
-    let gateway = args.get(2).ok_or(usage)?;
-    let sub_path = args.get(3).ok_or(usage)?;
-    let mediator = args.get(4).cloned();
-
-    let sub_raw = std::fs::read_to_string(sub_path).map_err(|e| {
-        format!(
-            "can't read subscription file '{sub_path}': {e}\n  \
-             Save the extension service-worker's `[pnm push] subscription:` JSON \
-             (its `{{endpoint, keys}}` object) to this path first."
-        )
-    })?;
-    let sub: serde_json::Value = serde_json::from_str(&sub_raw)
-        .map_err(|e| format!("'{sub_path}' is not valid JSON: {e}"))?;
-    let endpoint = sub["endpoint"]
-        .as_str()
-        .ok_or("subscription.endpoint missing")?;
-    let p256dh = sub["keys"]["p256dh"]
-        .as_str()
-        .ok_or("subscription.keys.p256dh missing")?;
-    let auth = sub["keys"]["auth"]
-        .as_str()
-        .ok_or("subscription.keys.auth missing")?;
-
+/// Shared core for the `test-wake*` helpers. Mints a throwaway `did:key`,
+/// registers the given platform `registration` under it (so it's the
+/// controller), provisions itself onto the allowlist, then fires a signed
+/// `push/wake`. Exercises the real gateway auth + allowlist + delivery path —
+/// no VTA, no hand-signing.
+async fn fire_wake(
+    gateway: &str,
+    registration: serde_json::Value,
+    mediator: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     // A throwaway did:key acting as both controller VTA (to provision) and
-    // trigger (to wake) — a real signed caller.
+    // trigger (to wake) — a real signed caller, not a backdoor.
     let mut seed = [0u8; 32];
     {
         use rand::Rng;
@@ -233,12 +221,11 @@ async fn test_wake(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         format!("did:key:z{}", bs58::encode(b).into_string())
     };
 
-    let base = gateway.trim_end_matches('/');
+    let url = format!("{}/trust-tasks", gateway.trim_end_matches('/'));
     let client = reqwest::Client::new();
-    let url = format!("{base}/trust-tasks");
 
-    // POST a Trust Task doc; sign the exact body bytes when `signed` (the gateway
-    // verifies the X-TT-Signature over the raw body).
+    // POST a Trust Task doc; sign the exact body bytes when `signer` is set (the
+    // gateway verifies the X-TT-Signature over the raw body).
     async fn post(
         client: &reqwest::Client,
         url: &str,
@@ -274,11 +261,7 @@ async fn test_wake(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let reg = serde_json::json!({
         "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
         "type": "https://trusttasks.org/spec/push/register/0.2",
-        "payload": {
-            "registration": { "platform": "webpush", "endpoint": endpoint,
-                              "keys": { "p256dh": p256dh, "auth": auth } },
-            "controllerVtaDid": did,
-        }
+        "payload": { "registration": registration, "controllerVtaDid": did }
     });
     let handle = post(&client, &url, &reg, None)
         .await?
@@ -314,8 +297,59 @@ async fn test_wake(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.as_str())
         .unwrap_or("(see below)");
     println!("3/3 wake → {status}");
-    println!("\nIf delivered, the extension service-worker console shows:");
-    println!("  [pnm push] push received: …");
     println!("\nfull wake response: {resp}");
     Ok(())
+}
+
+/// `test-wake <gateway-url> <subscription.json> [mediator-did]` — fire a wake at
+/// a registered **Web Push** subscription, end to end, with no VTA. The browser
+/// service-worker console then shows `[pnm push] push received: …`.
+async fn test_wake(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let usage = "usage: test-wake <gateway-url> <subscription.json> [mediator-did]";
+    let gateway = args.get(2).ok_or(usage)?;
+    let sub_path = args.get(3).ok_or(usage)?;
+    let mediator = args.get(4).cloned();
+
+    let sub_raw = std::fs::read_to_string(sub_path).map_err(|e| {
+        format!(
+            "can't read subscription file '{sub_path}': {e}\n  \
+             Save the extension service-worker's `[pnm push] subscription:` JSON \
+             (its `{{endpoint, keys}}` object) to this path first."
+        )
+    })?;
+    let sub: serde_json::Value = serde_json::from_str(&sub_raw)
+        .map_err(|e| format!("'{sub_path}' is not valid JSON: {e}"))?;
+    let endpoint = sub["endpoint"]
+        .as_str()
+        .ok_or("subscription.endpoint missing")?;
+    let p256dh = sub["keys"]["p256dh"]
+        .as_str()
+        .ok_or("subscription.keys.p256dh missing")?;
+    let auth = sub["keys"]["auth"]
+        .as_str()
+        .ok_or("subscription.keys.auth missing")?;
+
+    let registration = serde_json::json!({
+        "platform": "webpush", "endpoint": endpoint,
+        "keys": { "p256dh": p256dh, "auth": auth }
+    });
+    fire_wake(gateway, registration, mediator).await
+}
+
+/// `test-wake-apns <gateway-url> <apns-token-hex> <topic/bundle-id> [mediator-did]`
+/// — fire a wake at a registered **APNs** device token, end to end, with no VTA.
+/// The token is the hex string the iOS app logs (and shows in its UI). Uses the
+/// **sandbox** APNs environment (development builds); edit for production.
+async fn test_wake_apns(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let usage =
+        "usage: test-wake-apns <gateway-url> <apns-token-hex> <topic/bundle-id> [mediator-did]";
+    let gateway = args.get(2).ok_or(usage)?;
+    let token = args.get(3).ok_or(usage)?;
+    let topic = args.get(4).ok_or(usage)?;
+    let mediator = args.get(5).cloned();
+
+    let registration = serde_json::json!({
+        "platform": "apns", "token": token, "topic": topic, "environment": "sandbox"
+    });
+    fire_wake(gateway, registration, mediator).await
 }

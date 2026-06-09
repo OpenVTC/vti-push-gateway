@@ -31,6 +31,7 @@ use trust_tasks_rs::{RejectReason, TrustTask};
 use uuid::Uuid;
 
 use crate::auth::{self, HEADER_DID, HEADER_SIG};
+use crate::metrics::Metrics;
 use crate::sender::{self, PushSender, SendOutcome};
 use crate::store::{ProvisionOutcome, Store, WakeAuthz};
 use crate::types::{ProvisionRequest, RegisterRequest, WakePayload, WakeRequest};
@@ -41,13 +42,26 @@ pub struct AppState {
     pub senders: Arc<Vec<Box<dyn PushSender>>>,
     /// This gateway's externally-reachable address, echoed into issued handles.
     pub gateway_addr: String,
+    /// Operation counters scraped at `GET /metrics`.
+    pub metrics: Arc<Metrics>,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/trust-tasks", post(trust_tasks))
         .route("/healthz", get(|| async { "ok" }))
+        .route("/metrics", get(metrics))
         .with_state(state)
+}
+
+/// `GET /metrics` — Prometheus text exposition of the operation counters.
+async fn metrics(State(state): State<AppState>) -> Response {
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, "text/plain; version=0.0.4")],
+        state.metrics.render(),
+    )
+        .into_response()
 }
 
 fn new_id() -> String {
@@ -142,6 +156,7 @@ async fn handle_register(state: &AppState, doc: &TrustTask<Value>) -> Value {
     state
         .store
         .insert(handle.clone(), req.registration, req.controller_vta_did);
+    state.metrics.inc_register();
     success_value(
         doc,
         json!({ "wakeHandle": { "gateway": state.gateway_addr, "handle": handle } }),
@@ -163,23 +178,32 @@ async fn handle_provision(
     };
     let triggers = req.policy.allowed_triggers.clone();
     match state.store.provision(&req.handle, &caller, req.policy) {
-        ProvisionOutcome::Ok => success_value(
-            doc,
-            json!({ "handle": req.handle, "policy": { "allowedTriggers": triggers } }),
-        ),
-        ProvisionOutcome::UnknownHandle => reject_value(
-            doc,
-            RejectReason::TaskFailed {
-                reason: "unknown handle".into(),
-                details: None,
-            },
-        ),
-        ProvisionOutcome::NotController => reject_value(
-            doc,
-            RejectReason::PermissionDenied {
-                reason: "caller is not this handle's controller VTA".into(),
-            },
-        ),
+        ProvisionOutcome::Ok => {
+            state.metrics.inc_provision_ok();
+            success_value(
+                doc,
+                json!({ "handle": req.handle, "policy": { "allowedTriggers": triggers } }),
+            )
+        }
+        ProvisionOutcome::UnknownHandle => {
+            state.metrics.inc_provision_unknown_handle();
+            reject_value(
+                doc,
+                RejectReason::TaskFailed {
+                    reason: "unknown handle".into(),
+                    details: None,
+                },
+            )
+        }
+        ProvisionOutcome::NotController => {
+            state.metrics.inc_provision_not_controller();
+            reject_value(
+                doc,
+                RejectReason::PermissionDenied {
+                    reason: "caller is not this handle's controller VTA".into(),
+                },
+            )
+        }
     }
 }
 
@@ -195,6 +219,7 @@ async fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<V
     let registration = match state.store.authorize_wake(&req.handle, &trigger) {
         WakeAuthz::Allowed(reg) => reg,
         WakeAuthz::UnknownHandle => {
+            state.metrics.inc_wake_unknown_handle();
             return reject_value(
                 doc,
                 RejectReason::TaskFailed {
@@ -204,6 +229,7 @@ async fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<V
             );
         }
         WakeAuthz::NotAllowed => {
+            state.metrics.inc_wake_not_allowed();
             return reject_value(
                 doc,
                 RejectReason::PermissionDenied {
@@ -228,17 +254,24 @@ async fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<V
         urgency: req.urgency,
     };
     match s.send(&registration, &payload).await {
-        SendOutcome::Delivered => success_value(doc, json!({ "status": "delivered" })),
-        SendOutcome::TransientFailure => reject_value(
-            doc,
-            RejectReason::TaskFailed {
-                reason: "transient push-service failure; message remains queued".into(),
-                details: None,
-            },
-        ),
+        SendOutcome::Delivered => {
+            state.metrics.inc_wake_delivered();
+            success_value(doc, json!({ "status": "delivered" }))
+        }
+        SendOutcome::TransientFailure => {
+            state.metrics.inc_wake_transient_failure();
+            reject_value(
+                doc,
+                RejectReason::TaskFailed {
+                    reason: "transient push-service failure; message remains queued".into(),
+                    details: None,
+                },
+            )
+        }
         SendOutcome::PermanentlyUnregistered => {
             // Binding §3.2: drop the dead token; report it in-band.
             state.store.remove(&req.handle);
+            state.metrics.inc_wake_token_unregistered();
             success_value(doc, json!({ "status": "token-unregistered" }))
         }
     }

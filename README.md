@@ -46,7 +46,12 @@ Identity is provisioned like any integration: `pnm bootstrap
 provision-integration --template push-gateway --var URL=<gateway-didcomm-url>`,
 then open the bundle into the identity file.
 
-Roadmap: metrics · networked-resolver tuning for `did:webvh` senders.
+**Metrics** are exposed at `GET /metrics` in Prometheus text-exposition format
+(`gateway_register_total`, `gateway_provision_total{outcome}`,
+`gateway_wake_total{outcome}`) — counted in the transport-agnostic dispatch core,
+so both HTTPS and DIDComm wakes are covered.
+
+Roadmap: networked-resolver tuning for `did:webvh` senders.
 
 ## API
 
@@ -58,6 +63,7 @@ A single Trust-Task endpoint dispatches by the document's `type`:
 | POST   | `/trust-tasks`  | `push/provision/0.1`  | controller VTA | did-signed |
 | POST   | `/trust-tasks`  | `push/wake/0.1`       | trigger (mediator/VTA) | did-signed |
 | GET    | `/healthz`      | —                     | — | none |
+| GET    | `/metrics`      | —                     | scraper | none |
 
 Success returns a `…#response` Trust Task document; failure returns a
 `trust-task-error/0.1` document (the envelope carries the outcome).

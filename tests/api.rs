@@ -43,6 +43,7 @@ fn state() -> AppState {
         store: Arc::new(Store::new()),
         senders: Arc::new(senders),
         gateway_addr: "https://gw.test".into(),
+        metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
     }
 }
 
@@ -202,6 +203,85 @@ async fn register_v2_returns_v2_response() {
         doc["payload"]["wakeHandle"]["handle"].is_string()
             && doc["payload"]["wakeHandle"]["gateway"].is_string(),
         "0.2 response carries wakeHandle {{gateway, handle}}: {doc}"
+    );
+}
+
+/// The `/metrics` endpoint reflects real operation outcomes: a full
+/// register → provision → wake flow plus a refused wake show up as the right
+/// Prometheus counters, scraped through the same router.
+#[tokio::test]
+async fn metrics_endpoint_reflects_operations() {
+    let vta = signing_key();
+    let mediator = signing_key();
+    let app = router(state());
+
+    // register → handle.
+    let reg = tt_doc(
+        PUSH_REGISTER,
+        json!({
+            "registration": { "platform": "apns", "token": "abc", "topic": "org.openvtc.app" },
+            "controllerVtaDid": did_key_for(&vta),
+        }),
+    );
+    let handle = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await["payload"]
+        ["wakeHandle"]["handle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // provision the mediator, then a delivered wake.
+    let prov = tt_doc(
+        PUSH_PROVISION,
+        json!({ "handle": handle, "policy": { "allowedTriggers": [did_key_for(&mediator)] } }),
+    );
+    app.clone().oneshot(post(&prov, Some(&vta))).await.unwrap();
+    let wake = tt_doc(PUSH_WAKE, json!({ "handle": handle, "v": 1 }));
+    app.clone()
+        .oneshot(post(&wake, Some(&mediator)))
+        .await
+        .unwrap();
+
+    // a wake from a non-allowlisted trigger → not_allowed.
+    let imposter = signing_key();
+    app.clone()
+        .oneshot(post(&wake, Some(&imposter)))
+        .await
+        .unwrap();
+
+    // Scrape /metrics.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(text.contains("gateway_register_total 1\n"), "{text}");
+    assert!(
+        text.contains("gateway_provision_total{outcome=\"ok\"} 1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("gateway_wake_total{outcome=\"delivered\"} 1\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("gateway_wake_total{outcome=\"not_allowed\"} 1\n"),
+        "{text}"
     );
 }
 

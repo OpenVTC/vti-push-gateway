@@ -26,6 +26,7 @@ use trust_tasks_rs::TrustTask;
 
 use crate::api::{dispatch_push, AppState};
 use crate::identity::GatewayIdentity;
+use crate::resolver::ResolverTuning;
 
 /// DIDComm message type wrapping a Trust Task document (the DIDComm binding's
 /// envelope). The request body and the reply both carry a Trust Task doc here.
@@ -83,6 +84,11 @@ pub async fn start(
         Some(&identity.mediator),
         secrets,
     );
+    // Tuned DID resolver (cache + timeout) for did:webvh sender/recipient
+    // resolution; replaces the listener's implicit `TDKConfig::headless()`.
+    let tuning = ResolverTuning::from_env();
+    tracing::info!(resolver = %tuning.summary(), "DIDComm DID-resolver tuning");
+    let tdk_config = tuning.tdk_config()?;
     let config = DIDCommServiceConfig {
         listeners: vec![ListenerConfig {
             id: "push-gateway".into(),
@@ -93,6 +99,7 @@ pub async fn start(
                     max_delay_secs: 60,
                 },
             },
+            tdk_config: Some(tdk_config),
             ..Default::default()
         }],
     };

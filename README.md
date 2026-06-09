@@ -51,7 +51,14 @@ then open the bundle into the identity file.
 `gateway_wake_total{outcome}`) — counted in the transport-agnostic dispatch core,
 so both HTTPS and DIDComm wakes are covered.
 
-Roadmap: networked-resolver tuning for `did:webvh` senders.
+The **DID resolver** on the DIDComm path is tunable for `did:webvh` (whose
+resolution fetches a verifiable log over HTTPS — slower than `did:key`/`did:web`,
+yet rarely changing). Defaults raise the SDK's stock 300 s TTL / 5 s timeout to
+a 250-entry cache, **900 s** TTL, **10 s** timeout; override via the
+`GATEWAY_DID_*` env vars below, or point at a remote resolver service.
+
+Roadmap: the gateway is feature-complete (transports · senders · durable
+registry · metrics · resolver tuning).
 
 ## API
 
@@ -121,6 +128,12 @@ cargo run
 #                       account (Firebase) → enables the FCM sender
 # GATEWAY_STORE_FILE=./gateway-store.json   persist the handle registry to this
 #                       JSON snapshot (survives restart). Omit = in-memory.
+# DID resolver tuning (DIDComm path; all optional — defaults suit did:webvh):
+# GATEWAY_DID_CACHE_CAPACITY=250        max cached DID docs
+# GATEWAY_DID_CACHE_TTL_SECS=900        cache entry TTL (SDK default 300)
+# GATEWAY_DID_NETWORK_TIMEOUT_MS=10000  per-resolution timeout (SDK default 5000)
+# GATEWAY_DID_RESOLVER_URL=wss://…      resolve via a remote resolver service
+#                       instead of locally (unset = local resolution)
 # RUST_LOG=vti_push_gateway=debug
 ```
 

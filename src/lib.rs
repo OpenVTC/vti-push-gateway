@@ -6,6 +6,7 @@ pub mod api;
 pub mod auth;
 pub mod didcomm;
 pub mod identity;
+pub mod metrics;
 pub mod sender;
 pub mod store;
 pub mod types;

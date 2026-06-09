@@ -156,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         store: Arc::new(store),
         senders: Arc::new(senders),
         gateway_addr: gateway_addr.clone(),
+        metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
     };
 
     // Start the DIDComm listener (preferred transport) if provisioned.

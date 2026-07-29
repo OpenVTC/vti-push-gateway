@@ -1,9 +1,9 @@
 //! The gateway's `push/*` control plane: a transport-agnostic dispatch **core**
 //! ([`dispatch_push`]) plus the HTTPS transport adapter.
 //!
-//! - `push/register/0.1`  — device → opaque handle (token held by gateway).
-//! - `push/provision/0.1` — controller VTA → set the handle's trigger allowlist.
-//! - `push/wake/0.1`      — trigger → contentless wake, allowlist-gated.
+//! - `push/register/0.2`  — device → opaque handle (token held by gateway).
+//! - `push/provision/0.2` — controller VTA → set the handle's trigger allowlist.
+//! - `push/wake/0.2`      — trigger → contentless wake, allowlist-gated.
 //!
 //! [`dispatch_push`] takes an already-authenticated `sender` + a parsed
 //! `TrustTask` and returns the response **document** (a `…#response` or a
@@ -120,13 +120,17 @@ pub(crate) async fn dispatch_push(
 ) -> Value {
     let uri = &doc.type_uri;
     match (uri.slug(), uri.major(), uri.minor()) {
-        // `push/register` accepts both 0.1 and 0.2. The payload schemas are
-        // field-identical — 0.2 is the Trust-Tasks lowerCamelCase migration, a
-        // version-string bump for this no-enum payload — and `respond_with`
-        // mirrors the request version into the `#response`. See issue #7.
-        ("push/register", 0, 1 | 2) => handle_register(state, doc).await,
-        ("push/provision", 0, 1) => handle_provision(state, sender, doc).await,
-        ("push/wake", 0, 1) => handle_wake(state, sender, doc).await,
+        // The gateway speaks `push/*` 0.2 only — a clean cutover aligned with
+        // the registry's latest versions (issue #20; pre-production, so the
+        // 0.1 forms, including `push/register/0.1`'s former dual-accept leg
+        // from issue #7, are dropped rather than dual-accepted). 0.1→0.2 was
+        // the Trust-Tasks lowerCamelCase migration: request payloads are
+        // field-identical; `push/wake`'s response `status` enum became
+        // `tokenUnregistered`. `respond_with` mirrors the request version
+        // into the `#response`.
+        ("push/register", 0, 2) => handle_register(state, doc).await,
+        ("push/provision", 0, 2) => handle_provision(state, sender, doc).await,
+        ("push/wake", 0, 2) => handle_wake(state, sender, doc).await,
         _ => reject_value(
             doc,
             RejectReason::UnsupportedType {
@@ -270,9 +274,10 @@ async fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<V
         }
         SendOutcome::PermanentlyUnregistered => {
             // Binding §3.2: drop the dead token; report it in-band.
+            // (`tokenUnregistered` is the 0.2 spelling of the status enum.)
             state.store.remove(&req.handle);
             state.metrics.inc_wake_token_unregistered();
-            success_value(doc, json!({ "status": "token-unregistered" }))
+            success_value(doc, json!({ "status": "tokenUnregistered" }))
         }
     }
 }

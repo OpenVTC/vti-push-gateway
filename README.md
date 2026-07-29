@@ -21,9 +21,9 @@ the VTA owns the allowlist).
 ## Status
 
 The gateway's control plane is the **`push/*` Trust Task family**
-([`push/register`](https://trusttasks.org/spec/push/register/0.1),
-[`push/provision`](https://trusttasks.org/spec/push/provision/0.1),
-[`push/wake`](https://trusttasks.org/spec/push/wake/0.1)). It dispatches
+([`push/register`](https://trusttasks.org/spec/push/register/0.2),
+[`push/provision`](https://trusttasks.org/spec/push/provision/0.2),
+[`push/wake`](https://trusttasks.org/spec/push/wake/0.2)). It dispatches
 `TrustTask` documents (canonical `trust-tasks-rs` envelope), so the same
 documents ride the **DIDComm binding (preferred) or HTTPS (fallback)**.
 
@@ -66,9 +66,9 @@ A single Trust-Task endpoint dispatches by the document's `type`:
 
 | Method | Path            | `type`                | Caller | Auth (HTTPS) |
 |--------|-----------------|-----------------------|--------|--------------|
-| POST   | `/trust-tasks`  | `push/register/0.1`   | device | none |
-| POST   | `/trust-tasks`  | `push/provision/0.1`  | controller VTA | did-signed |
-| POST   | `/trust-tasks`  | `push/wake/0.1`       | trigger (mediator/VTA) | did-signed |
+| POST   | `/trust-tasks`  | `push/register/0.2`   | device | none |
+| POST   | `/trust-tasks`  | `push/provision/0.2`  | controller VTA | did-signed |
+| POST   | `/trust-tasks`  | `push/wake/0.2`       | trigger (mediator/VTA) | did-signed |
 | GET    | `/healthz`      | —                     | — | none |
 | GET    | `/metrics`      | —                     | scraper | none |
 
@@ -94,17 +94,17 @@ doorbell), so no nonce is required — see binding §6.
 
 ```jsonc
 // POST /trust-tasks   — push/register (unauthenticated)
-{ "id": "urn:uuid:1", "type": "https://trusttasks.org/spec/push/register/0.1",
+{ "id": "urn:uuid:1", "type": "https://trusttasks.org/spec/push/register/0.2",
   "payload": { "registration": { "platform": "apns", "token": "…", "topic": "org.openvtc.vta-mobile-agent" },
                "controllerVtaDid": "did:webvh:…:vta" } }
 // → 200  …#response  { "payload": { "wakeHandle": { "gateway": "https://gw.example", "handle": "z6Mk…" } } }
 
 // POST /trust-tasks   — push/provision (signed by the controller VTA)
-{ "id": "urn:uuid:2", "type": "https://trusttasks.org/spec/push/provision/0.1",
+{ "id": "urn:uuid:2", "type": "https://trusttasks.org/spec/push/provision/0.2",
   "payload": { "handle": "z6Mk…", "policy": { "allowedTriggers": ["did:webvh:…:mediator", "did:webvh:…:vta"] } } }
 
 // POST /trust-tasks   — push/wake (signed by an allowed trigger)
-{ "id": "urn:uuid:3", "type": "https://trusttasks.org/spec/push/wake/0.1",
+{ "id": "urn:uuid:3", "type": "https://trusttasks.org/spec/push/wake/0.2",
   "payload": { "handle": "z6Mk…", "v": 1, "mediator": "did:webvh:…:mediator", "urgency": "interactive" } }
 // → 200  …#response  { "payload": { "status": "delivered" } }  (echo sender logs the contentless wake)
 ```

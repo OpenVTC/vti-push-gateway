@@ -314,7 +314,7 @@ async fn fire_wake(
     // 2. provision (signed; we are the controller) → allowlist = [self].
     let prov = serde_json::json!({
         "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        "type": "https://trusttasks.org/spec/push/provision/0.1",
+        "type": "https://trusttasks.org/spec/push/provision/0.2",
         "payload": { "handle": handle, "policy": { "allowedTriggers": [did] } }
     });
     post(&client, &url, &prov, Some((&did, &sk))).await?;
@@ -328,7 +328,7 @@ async fn fire_wake(
     }
     let wake = serde_json::json!({
         "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        "type": "https://trusttasks.org/spec/push/wake/0.1",
+        "type": "https://trusttasks.org/spec/push/wake/0.2",
         "payload": wake_payload
     });
     let resp = post(&client, &url, &wake, Some((&did, &sk))).await?;

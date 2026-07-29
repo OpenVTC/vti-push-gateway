@@ -14,14 +14,17 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use vti_push_gateway::api::{router, AppState};
-use vti_push_gateway::sender::{EchoSender, PushSender};
+use vti_push_gateway::sender::{EchoSender, PushSender, SendOutcome};
 use vti_push_gateway::store::Store;
 
 const ED25519_MULTICODEC: [u8; 2] = [0xed, 0x01];
-const PUSH_REGISTER: &str = "https://trusttasks.org/spec/push/register/0.1";
-const PUSH_REGISTER_V2: &str = "https://trusttasks.org/spec/push/register/0.2";
-const PUSH_PROVISION: &str = "https://trusttasks.org/spec/push/provision/0.1";
-const PUSH_WAKE: &str = "https://trusttasks.org/spec/push/wake/0.1";
+const PUSH_REGISTER: &str = "https://trusttasks.org/spec/push/register/0.2";
+const PUSH_PROVISION: &str = "https://trusttasks.org/spec/push/provision/0.2";
+const PUSH_WAKE: &str = "https://trusttasks.org/spec/push/wake/0.2";
+// Retired 0.1 forms — the gateway is 0.2-only (issue #20 clean cutover).
+const PUSH_REGISTER_V1: &str = "https://trusttasks.org/spec/push/register/0.1";
+const PUSH_PROVISION_V1: &str = "https://trusttasks.org/spec/push/provision/0.1";
+const PUSH_WAKE_V1: &str = "https://trusttasks.org/spec/push/wake/0.1";
 
 /// Generate a signing key from OS randomness (rand 0.10), avoiding
 /// ed25519-dalek's rand_core-0.6-tied `generate`.
@@ -178,14 +181,14 @@ async fn full_flow_register_provision_wake() {
     );
 }
 
-/// Issue #7: a `push/register/0.2` document is accepted (payload-identical to
-/// 0.1) and the success response mirrors the request version.
+/// A `push/register/0.2` success response mirrors the request's 0.2 version
+/// and carries the opaque `wakeHandle {gateway, handle}`.
 #[tokio::test]
 async fn register_v2_returns_v2_response() {
     let vta = signing_key();
     let app = router(state());
     let reg = tt_doc(
-        PUSH_REGISTER_V2,
+        PUSH_REGISTER,
         json!({
             "registration": { "platform": "apns", "token": "abc", "topic": "org.openvtc.app" },
             "controllerVtaDid": did_key_for(&vta),
@@ -204,6 +207,102 @@ async fn register_v2_returns_v2_response() {
             && doc["payload"]["wakeHandle"]["gateway"].is_string(),
         "0.2 response carries wakeHandle {{gateway, handle}}: {doc}"
     );
+}
+
+/// Issue #20 clean cutover: every retired `push/*/0.1` URI is refused with an
+/// `unsupported type` error document — the gateway speaks 0.2 only.
+#[tokio::test]
+async fn v0_1_uris_are_rejected() {
+    let vta = signing_key();
+    let app = router(state());
+    let docs = [
+        tt_doc(
+            PUSH_REGISTER_V1,
+            json!({
+                "registration": { "platform": "apns", "token": "abc", "topic": "org.openvtc.app" },
+                "controllerVtaDid": did_key_for(&vta),
+            }),
+        ),
+        tt_doc(
+            PUSH_PROVISION_V1,
+            json!({ "handle": "h", "policy": { "allowedTriggers": [] } }),
+        ),
+        tt_doc(PUSH_WAKE_V1, json!({ "handle": "h", "v": 1 })),
+    ];
+    for req in &docs {
+        let doc = body_json(app.clone().oneshot(post(req, Some(&vta))).await.unwrap()).await;
+        assert!(
+            !is_success(&doc),
+            "retired 0.1 URI {} must be rejected: {doc}",
+            req["type"]
+        );
+    }
+}
+
+/// A sender whose push service reports the token permanently unregistered.
+struct DeadTokenSender;
+
+#[async_trait::async_trait]
+impl PushSender for DeadTokenSender {
+    fn handles(&self, _registration: &vti_push_gateway::types::PushRegistration) -> bool {
+        true
+    }
+    async fn send(
+        &self,
+        _registration: &vti_push_gateway::types::PushRegistration,
+        _payload: &vti_push_gateway::types::WakePayload,
+    ) -> SendOutcome {
+        SendOutcome::PermanentlyUnregistered
+    }
+}
+
+/// A dead token surfaces as the 0.2 `tokenUnregistered` status (0.1 spelled it
+/// `token-unregistered`) and the handle is dropped.
+#[tokio::test]
+async fn dead_token_reports_v2_token_unregistered_status() {
+    let vta = signing_key();
+    let mediator = signing_key();
+    let senders: Vec<Box<dyn PushSender>> = vec![Box::new(DeadTokenSender)];
+    let mut st = state();
+    st.senders = Arc::new(senders);
+    let app = router(st);
+
+    let reg = tt_doc(
+        PUSH_REGISTER,
+        json!({
+            "registration": { "platform": "apns", "token": "dead", "topic": "org.openvtc.app" },
+            "controllerVtaDid": did_key_for(&vta),
+        }),
+    );
+    let handle = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await["payload"]
+        ["wakeHandle"]["handle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let prov = tt_doc(
+        PUSH_PROVISION,
+        json!({ "handle": handle, "policy": { "allowedTriggers": [did_key_for(&mediator)] } }),
+    );
+    let doc = body_json(app.clone().oneshot(post(&prov, Some(&vta))).await.unwrap()).await;
+    assert!(is_success(&doc), "provision should succeed: {doc}");
+
+    let wake = tt_doc(PUSH_WAKE, json!({ "handle": handle, "v": 1 }));
+    let doc = body_json(
+        app.clone()
+            .oneshot(post(&wake, Some(&mediator)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(is_success(&doc), "dead-token wake reports in-band: {doc}");
+    assert_eq!(
+        doc["payload"]["status"], "tokenUnregistered",
+        "0.2 camelCase status expected: {doc}"
+    );
+
+    // The handle was dropped — a second wake finds it unknown.
+    let doc = body_json(app.oneshot(post(&wake, Some(&mediator))).await.unwrap()).await;
+    assert!(!is_success(&doc), "dropped handle must be unknown: {doc}");
 }
 
 /// The `/metrics` endpoint reflects real operation outcomes: a full
@@ -317,7 +416,7 @@ async fn bad_signature_is_401() {
     let mut req = post(&wake, Some(&trigger));
     // Replace the body after signing → signature no longer matches.
     *req.body_mut() = Body::from(
-        r#"{"id":"urn:uuid:req","type":"https://trusttasks.org/spec/push/wake/0.1","payload":{"handle":"tampered","v":1}}"#,
+        r#"{"id":"urn:uuid:req","type":"https://trusttasks.org/spec/push/wake/0.2","payload":{"handle":"tampered","v":1}}"#,
     );
     assert_eq!(
         app.oneshot(req).await.unwrap().status(),

@@ -53,7 +53,7 @@ pub struct WebPushKeys {
     pub auth: String,
 }
 
-/// `push/register/0.1` payload — register a token, name the controller VTA.
+/// `push/register/0.2` payload — register a token, name the controller VTA.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RegisterRequest {
@@ -70,14 +70,14 @@ pub struct WakeTriggerPolicy {
     pub allowed_triggers: Vec<String>,
 }
 
-/// `push/provision/0.1` payload — set a handle's allowlist.
+/// `push/provision/0.2` payload — set a handle's allowlist.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProvisionRequest {
     pub handle: String,
     pub policy: WakeTriggerPolicy,
 }
 
-/// `push/wake/0.1` payload — contentless wake request. Carries only the binding
+/// `push/wake/0.2` payload — contentless wake request. Carries only the binding
 /// §2 hint fields; never task content.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WakeRequest {

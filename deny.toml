@@ -9,14 +9,18 @@
 [advisories]
 # Fail on any security vulnerability or unsound advisory. Specific IDs may be
 # suppressed below with a documented justification.
+# Keep this list to advisories we genuinely cannot act on, each with a reason
+# and a condition for removal. cargo-deny errors on an ignore that matches
+# nothing, so a stale entry fails the check rather than rotting quietly — which
+# is how RUSTSEC-2024-0370 (proc-macro-error unmaintained) left this list: it
+# said "revisit when the affinidi crates drop it", and `affinidi-tdk` 0.8 did.
 ignore = [
-  # proc-macro-error is unmaintained (RUSTSEC-2024-0370). It is a *build-time*
-  # proc-macro helper pulled transitively by the Affinidi DID stack
-  # (linked-data-derive → linked-data → json-ld → ssi-* → affinidi-*), not a
-  # runtime dependency, and the advisory is "unmaintained", not a
-  # vulnerability. Nothing we control selects it; revisit when the affinidi
-  # crates drop it.
-  "RUSTSEC-2024-0370",
+  # rustls-pemfile is unmaintained (RUSTSEC-2025-0134). Pulled transitively by
+  # the Affinidi stack (affinidi-messaging-sdk and affinidi-tdk-common), not
+  # selected by anything here, and the advisory is "unmaintained", not a
+  # vulnerability. Revisit when the affinidi crates move to rustls-pki-types'
+  # built-in PEM parsing.
+  "RUSTSEC-2025-0134",
 ]
 
 [licenses]

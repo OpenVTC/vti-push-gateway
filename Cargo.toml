@@ -28,15 +28,15 @@ rand = "0.10"
 # Canonical Trust Task envelope + the push/* payload types (the gateway's
 # control plane is the push/* Trust Task family). The gateway dispatches
 # push/register|provision|wake documents over HTTPS (and, next, DIDComm).
-trust-tasks-rs = { version = "0.9", default-features = false }
+trust-tasks-rs = { version = "0.17", default-features = false }
 # Response document ids (urn:uuid).
 uuid = { version = "1", features = ["v4"] }
 # DIDComm server transport (the preferred transport). Mirrors vta-service:
 # DIDCommService + Router host that does server-side unpack + sender-auth; the
 # gateway provides its provisioned did:webvh identity secrets + a Router of
 # push/* handlers that call the shared dispatch_push core.
-affinidi-messaging-didcomm-service = "0.3"
-affinidi-tdk = "0.8"
+affinidi-messaging-didcomm-service = "0.5"
+affinidi-tdk = "0.10"
 affinidi-secrets-resolver = "0.5"
 affinidi-did-resolver-cache-sdk = { version = "0.8", features = ["network"] }
 tokio-util = "0.7"

@@ -12,7 +12,7 @@
 //! - [`EchoSender`] — dev: logs the wake, delivers nothing. Handles every
 //!   platform, so it's the fallback (any platform with no credentials).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -26,7 +26,19 @@ use p256::pkcs8::DecodePrivateKey;
 use p256::SecretKey;
 use web_push_native::{Auth, WebPushBuilder};
 
-use crate::types::{ApnsEnvironment, PushRegistration, Urgency, WakePayload};
+use crate::egress::{self, EgressPolicy};
+use crate::types::{
+    is_valid_apns_token, ApnsEnvironment, PushRegistration, Urgency, WakePayload, WebPushKeys,
+};
+
+/// Build the HTTP client every push sender uses: see
+/// [`egress::hardened_client_builder`] (no redirects, no proxies, https only,
+/// guarded DNS resolution, connect/total timeouts).
+fn push_client(policy: &EgressPolicy, what: &str) -> Result<reqwest::Client, String> {
+    egress::hardened_client_builder(policy)
+        .build()
+        .map_err(|e| format!("{what} client init: {e}"))
+}
 
 /// Decode a PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----` … base64 … `-----END …`)
 /// into DER bytes — used for the FCM service-account RSA signing key.
@@ -43,10 +55,32 @@ fn b64url(bytes: &[u8]) -> String {
 }
 
 /// Decode a base64url subscription field, tolerating optional padding.
-fn b64url_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn b64url_decode(s: &str) -> Option<Vec<u8>> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s.trim().trim_end_matches('='))
         .ok()
+}
+
+/// Decode a subscription's keys: `p256dh` must be a 65-byte uncompressed
+/// P-256 point and `auth` a 16-byte secret (RFC 8291). Shared by registration
+/// validation and the sender.
+pub(crate) fn decode_webpush_keys(
+    keys: &WebPushKeys,
+) -> Result<(p256::PublicKey, Auth), &'static str> {
+    let (Some(p256dh), Some(auth)) = (b64url_decode(&keys.p256dh), b64url_decode(&keys.auth))
+    else {
+        return Err("webpush keys must be base64url");
+    };
+    if p256dh.len() != 65 {
+        return Err("webpush p256dh must be a 65-byte uncompressed P-256 point");
+    }
+    let Ok(ua_public) = p256::PublicKey::from_sec1_bytes(&p256dh) else {
+        return Err("webpush p256dh is not a valid P-256 point");
+    };
+    if auth.len() != 16 {
+        return Err("webpush auth secret must be 16 bytes");
+    }
+    Ok((ua_public, Auth::clone_from_slice(&auth)))
 }
 
 /// Generate a fresh VAPID (P-256) keypair, so an operator never needs `openssl`.
@@ -139,6 +173,8 @@ pub struct WebPushSender {
     /// VAPID `sub` claim — an operator contact (`mailto:` / https URL).
     subject: String,
     client: reqwest::Client,
+    /// Endpoint policy, re-checked before every send.
+    egress: Arc<EgressPolicy>,
 }
 
 /// VAPID JWTs are valid for 12 hours (RFC 8292 caps `exp` at 24h).
@@ -146,9 +182,14 @@ const VAPID_TOKEN_TTL_SECS: u64 = 12 * 60 * 60;
 
 impl WebPushSender {
     /// Build a sender from the gateway's VAPID **private** key (PEM — PKCS#8 or
-    /// SEC1) and a contact subject. The matching public key is what subscribers
-    /// register as their `applicationServerKey`.
-    pub fn new(vapid_pem: Vec<u8>, subject: String) -> Result<Self, String> {
+    /// SEC1), a contact subject, and the egress policy endpoints must satisfy.
+    /// The matching public key is what subscribers register as their
+    /// `applicationServerKey`.
+    pub fn new(
+        vapid_pem: Vec<u8>,
+        subject: String,
+        egress: Arc<EgressPolicy>,
+    ) -> Result<Self, String> {
         let pem =
             std::str::from_utf8(&vapid_pem).map_err(|e| format!("VAPID PEM not utf-8: {e}"))?;
         let secret = SecretKey::from_pkcs8_pem(pem)
@@ -161,14 +202,13 @@ impl WebPushSender {
                 .to_encoded_point(false)
                 .as_bytes(),
         );
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| format!("web push client init: {e}"))?;
+        let client = push_client(&egress, "web push")?;
         Ok(Self {
             signing_key,
             vapid_public,
             subject,
             client,
+            egress,
         })
     }
 
@@ -213,24 +253,27 @@ impl PushSender for WebPushSender {
         let PushRegistration::Webpush { endpoint, keys } = registration else {
             return SendOutcome::TransientFailure; // not ours (select() shouldn't route here)
         };
-        let Ok(uri) = endpoint.parse::<Uri>() else {
+        // Re-check the endpoint before dialling it: a stored record can predate
+        // register-time validation, and the policy can tighten after it.
+        let url = match self.egress.validate_webpush_endpoint(endpoint) {
+            Ok(url) => url,
+            Err(e) => {
+                tracing::warn!(error = %e, "web push endpoint refused by egress policy; not sending");
+                return SendOutcome::TransientFailure;
+            }
+        };
+        // Build the request from the validated URL, never the raw string.
+        let Ok(uri) = url.as_str().parse::<Uri>() else {
             tracing::warn!("web push endpoint is not a valid URI");
             return SendOutcome::TransientFailure;
         };
-        let (Some(p256dh), Some(auth)) = (b64url_decode(&keys.p256dh), b64url_decode(&keys.auth))
-        else {
-            tracing::warn!("web push subscription keys are not valid base64url");
-            return SendOutcome::TransientFailure;
+        let (ua_public, ua_auth) = match decode_webpush_keys(keys) {
+            Ok(k) => k,
+            Err(reason) => {
+                tracing::warn!(reason, "web push subscription keys are invalid");
+                return SendOutcome::TransientFailure;
+            }
         };
-        let Ok(ua_public) = p256::PublicKey::from_sec1_bytes(&p256dh) else {
-            tracing::warn!("web push p256dh is not a valid P-256 point");
-            return SendOutcome::TransientFailure;
-        };
-        if auth.len() != 16 {
-            tracing::warn!(len = auth.len(), "web push auth secret must be 16 bytes");
-            return SendOutcome::TransientFailure;
-        }
-        let ua_auth = Auth::clone_from_slice(&auth);
 
         // The encrypted payload is the contentless doorbell (binding §2) — only
         // the WakePayload hint fields, never task content.
@@ -259,6 +302,19 @@ impl PushSender for WebPushSender {
                 return SendOutcome::TransientFailure;
             }
         };
+        // The conversion re-parses the URI: the URL actually dialled must still
+        // be the validated one.
+        if req.url().origin() != url.origin()
+            || self
+                .egress
+                .validate_webpush_endpoint(req.url().as_str())
+                .is_err()
+        {
+            tracing::warn!(
+                "web push request URL diverged from the validated endpoint; not sending"
+            );
+            return SendOutcome::TransientFailure;
+        }
         match self.client.execute(req).await {
             Ok(resp) if resp.status().is_success() => SendOutcome::Delivered,
             // 404/410 — the subscription is gone; drop the handle (binding §3.2).
@@ -327,9 +383,7 @@ impl ApnsSender {
         let secret = SecretKey::from_pkcs8_pem(pem)
             .map_err(|e| format!("parse APNs key (expected P-256 PKCS#8 .p8 PEM): {e}"))?;
         let signing_key = SigningKey::from(&secret);
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| format!("APNs client init: {e}"))?;
+        let client = push_client(&EgressPolicy::default(), "APNs")?;
         Ok(Self {
             team_id,
             key_id,
@@ -392,6 +446,12 @@ impl PushSender for ApnsSender {
         else {
             return SendOutcome::TransientFailure; // not ours (select() shouldn't route here)
         };
+        // The token becomes part of the request path. Registration validates
+        // it; this also covers records stored before that check existed.
+        if !is_valid_apns_token(token) {
+            tracing::warn!("APNs token is not a hex device token; not sending");
+            return SendOutcome::TransientFailure;
+        }
         // Sandbox vs production is the only difference in host; default to
         // production when the device didn't say.
         let host = match environment {
@@ -521,9 +581,7 @@ impl FcmSender {
         let der = pem_to_der(&sa.private_key)?;
         let signing_key = aws_lc_rs::signature::RsaKeyPair::from_pkcs8(&der)
             .map_err(|e| format!("parse FCM service-account key (expected RSA PKCS#8): {e}"))?;
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| format!("FCM client init: {e}"))?;
+        let client = push_client(&EgressPolicy::default(), "FCM")?;
         Ok(Self {
             project_id: sa.project_id,
             client_email: sa.client_email,
@@ -704,6 +762,15 @@ MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2pdM+9XyrmPA1+sL
 IEi5IEIIVCOOhTviiI9vnxIg8awULr5vD3yBD1uHnzlkoCihDa7mzLS+
 -----END PRIVATE KEY-----";
 
+    fn web_push_sender(policy: EgressPolicy) -> WebPushSender {
+        WebPushSender::new(
+            TEST_VAPID_PEM.to_vec(),
+            "mailto:x@y".into(),
+            Arc::new(policy),
+        )
+        .unwrap()
+    }
+
     fn webpush() -> PushRegistration {
         PushRegistration::Webpush {
             endpoint: "https://push.example/x".into(),
@@ -724,7 +791,7 @@ IEi5IEIIVCOOhTviiI9vnxIg8awULr5vD3yBD1uHnzlkoCihDa7mzLS+
 
     #[test]
     fn webpush_sender_handles_only_webpush() {
-        let s = WebPushSender::new(TEST_VAPID_PEM.to_vec(), "mailto:x@y".into()).unwrap();
+        let s = web_push_sender(EgressPolicy::default());
         assert!(s.handles(&webpush()));
         assert!(!s.handles(&apns()));
     }
@@ -736,7 +803,12 @@ IEi5IEIIVCOOhTviiI9vnxIg8awULr5vD3yBD1uHnzlkoCihDa7mzLS+
     fn vapid_authorization_is_a_valid_es256_jwt() {
         use p256::ecdsa::signature::Verifier;
 
-        let sender = WebPushSender::new(TEST_VAPID_PEM.to_vec(), "mailto:ops@gw".into()).unwrap();
+        let sender = WebPushSender::new(
+            TEST_VAPID_PEM.to_vec(),
+            "mailto:ops@gw".into(),
+            Arc::new(EgressPolicy::default()),
+        )
+        .unwrap();
         let endpoint: Uri = "https://push.example.com/sub/abc?x=1".parse().unwrap();
         let header = sender.vapid_authorization(&endpoint).unwrap();
 
@@ -775,7 +847,7 @@ IEi5IEIIVCOOhTviiI9vnxIg8awULr5vD3yBD1uHnzlkoCihDa7mzLS+
     #[test]
     fn select_prefers_webpush_then_falls_back_to_echo() {
         let senders: Vec<Box<dyn PushSender>> = vec![
-            Box::new(WebPushSender::new(TEST_VAPID_PEM.to_vec(), "mailto:x@y".into()).unwrap()),
+            Box::new(web_push_sender(EgressPolicy::default())),
             Box::new(EchoSender),
         ];
         // webpush is handled (by the WebPushSender, first in order)…
@@ -794,7 +866,12 @@ IEi5IEIIVCOOhTviiI9vnxIg8awULr5vD3yBD1uHnzlkoCihDa7mzLS+
         let (pem, public) = generate_vapid_keypair().unwrap();
         // The generated PEM loads as a Web Push sender, and the public key we
         // returned matches what the sender advertises — a matched pair.
-        let s = WebPushSender::new(pem.into_bytes(), "mailto:ops@gw".into()).unwrap();
+        let s = WebPushSender::new(
+            pem.into_bytes(),
+            "mailto:ops@gw".into(),
+            Arc::new(EgressPolicy::default()),
+        )
+        .unwrap();
         assert_eq!(s.vapid_public(), public);
         // Distinct each time (it's random).
         let (_, public2) = generate_vapid_keypair().unwrap();
@@ -849,7 +926,7 @@ IEi5IEIIVCOOhTviiI9vnxIg8awULr5vD3yBD1uHnzlkoCihDa7mzLS+
     #[test]
     fn select_routes_apns_to_the_apns_sender() {
         let senders: Vec<Box<dyn PushSender>> = vec![
-            Box::new(WebPushSender::new(TEST_VAPID_PEM.to_vec(), "mailto:x@y".into()).unwrap()),
+            Box::new(web_push_sender(EgressPolicy::default())),
             Box::new(
                 ApnsSender::new(TEST_APNS_P8.to_vec(), "KEYID123".into(), "TEAMID456".into())
                     .unwrap(),
@@ -954,5 +1031,181 @@ JIdgVjmcJ6J16mUbDYosCYI=
         public
             .verify(signing_input.as_bytes(), &sig)
             .expect("RS256 assertion signature verifies");
+    }
+
+    // ── Outbound client behaviour ────────────────────────────────────────────
+
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// A valid subscription key pair (65-byte P-256 point, 16-byte auth).
+    const TEST_P256DH: &str =
+        "BHTHkS5TN8hSA9_AzgRusH55jqrZjomGJ42mYrmFNIKH1cc0JnR6ZzwjcWQljvhdjlapl3nOtq2P6e9IMjMoWrY";
+    const TEST_AUTH: &str = "-8GwtL6MnCVPpyjEYoad2A";
+
+    fn webpush_at(endpoint: String) -> PushRegistration {
+        PushRegistration::Webpush {
+            endpoint,
+            keys: WebPushKeys {
+                p256dh: TEST_P256DH.into(),
+                auth: TEST_AUTH.into(),
+            },
+        }
+    }
+
+    fn wake_payload() -> WakePayload {
+        WakePayload {
+            v: 1,
+            mediator: None,
+            count: None,
+            urgency: None,
+        }
+    }
+
+    /// Bind a loopback port that counts accepted connections and holds them
+    /// open without ever answering.
+    async fn silent_listener() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(sock);
+            }
+        });
+        (addr, accepted)
+    }
+
+    #[test]
+    fn subscription_keys_are_validated() {
+        let ok = WebPushKeys {
+            p256dh: TEST_P256DH.into(),
+            auth: TEST_AUTH.into(),
+        };
+        assert!(decode_webpush_keys(&ok).is_ok());
+        for (p256dh, auth) in [
+            ("k", TEST_AUTH),
+            (TEST_P256DH, "a"),
+            ("!!!!", TEST_AUTH),
+            // A valid-length but non-point 65 bytes.
+            (&*b64url(&[4u8; 65]), TEST_AUTH),
+            // A compressed (33-byte) point is not accepted.
+            (&*b64url(&[2u8; 33]), TEST_AUTH),
+        ] {
+            let keys = WebPushKeys {
+                p256dh: p256dh.into(),
+                auth: auth.into(),
+            };
+            assert!(decode_webpush_keys(&keys).is_err(), "{p256dh} / {auth}");
+        }
+    }
+
+    /// A 3xx from the push endpoint is reported as a failed send; the
+    /// `Location` target is never contacted.
+    #[tokio::test]
+    async fn web_push_does_not_follow_redirects() {
+        let (target, target_accepted) = silent_listener().await;
+
+        let redirector = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirector_addr = redirector.local_addr().unwrap();
+        let redirector_hits = Arc::new(AtomicUsize::new(0));
+        let hits = redirector_hits.clone();
+        let location = format!("http://{target}/followed");
+        let app = axum::Router::new().route(
+            "/sub",
+            axum::routing::post(move || {
+                let hits = hits.clone();
+                let location = location.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, location)],
+                    )
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(redirector, app).await.unwrap() });
+
+        let sender = web_push_sender(EgressPolicy::for_loopback_tests());
+        let outcome = sender
+            .send(
+                &webpush_at(format!("http://{redirector_addr}/sub")),
+                &wake_payload(),
+            )
+            .await;
+
+        assert_eq!(outcome, SendOutcome::TransientFailure);
+        assert_eq!(
+            redirector_hits.load(Ordering::SeqCst),
+            1,
+            "the registered endpoint is contacted once"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            target_accepted.load(Ordering::SeqCst),
+            0,
+            "the redirect target must not be contacted"
+        );
+    }
+
+    /// A push service that accepts the connection but never answers cannot
+    /// hold a send past the client's total timeout.
+    #[tokio::test]
+    async fn web_push_send_is_bounded_by_the_client_timeout() {
+        let (addr, accepted) = silent_listener().await;
+        let sender = web_push_sender(EgressPolicy::for_loopback_tests());
+        let started = Instant::now();
+        let outcome = sender
+            .send(&webpush_at(format!("http://{addr}/sub")), &wake_payload())
+            .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(outcome, SendOutcome::TransientFailure);
+        assert!(accepted.load(Ordering::SeqCst) >= 1, "server was reached");
+        assert!(
+            elapsed >= egress::PUSH_REQUEST_TIMEOUT - Duration::from_millis(500)
+                && elapsed < egress::PUSH_REQUEST_TIMEOUT + Duration::from_secs(2),
+            "send returned after {elapsed:?}"
+        );
+    }
+
+    /// With the production policy, a loopback endpoint is refused before any
+    /// connection is attempted.
+    #[tokio::test]
+    async fn production_policy_never_dials_loopback() {
+        let (addr, accepted) = silent_listener().await;
+        let sender = web_push_sender(EgressPolicy::default());
+        for endpoint in [
+            format!("http://{addr}/sub"),
+            format!("https://{addr}/sub"),
+            format!("https://localhost:{}/sub", addr.port()),
+        ] {
+            let outcome = sender.send(&webpush_at(endpoint), &wake_payload()).await;
+            assert_eq!(outcome, SendOutcome::TransientFailure);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(accepted.load(Ordering::SeqCst), 0);
+    }
+
+    /// An APNs token that is not a hex device token never reaches the request
+    /// path.
+    #[tokio::test]
+    async fn apns_refuses_non_hex_token_without_sending() {
+        let s =
+            ApnsSender::new(TEST_APNS_P8.to_vec(), "KEYID123".into(), "TEAMID456".into()).unwrap();
+        let reg = PushRegistration::Apns {
+            token: "../../3/device/x".into(),
+            topic: "org.x".into(),
+            environment: None,
+        };
+        assert_eq!(
+            s.send(&reg, &wake_payload()).await,
+            SendOutcome::TransientFailure
+        );
     }
 }

@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use vti_push_gateway::api::{self, AppState};
 use vti_push_gateway::didcomm;
+use vti_push_gateway::egress::{EgressPolicy, ENV_APNS_TOPICS};
 use vti_push_gateway::identity::GatewayIdentity;
 use vti_push_gateway::sender::{
     generate_vapid_keypair, ApnsSender, EchoSender, FcmSender, PushSender, WebPushSender,
@@ -54,6 +55,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let bind = std::env::var("GATEWAY_BIND").unwrap_or_else(|_| "127.0.0.1:8300".into());
 
+    // Egress policy: which Web Push services a registration's endpoint may name
+    // (GATEWAY_WEBPUSH_ALLOWED_HOSTS) and which APNs topics it may use
+    // (GATEWAY_APNS_TOPICS). An invalid or over-broad value stops startup.
+    let egress = Arc::new(EgressPolicy::from_env().map_err(|e| format!("egress policy: {e}"))?);
+    tracing::info!(
+        hosts = %egress.webpush_hosts().join(","),
+        "Web Push endpoint host allow-list"
+    );
+    match egress.apns_topics() {
+        Some(topics) => tracing::info!(
+            topics = %topics.iter().map(String::as_str).collect::<Vec<_>>().join(","),
+            "APNs topic allow-list"
+        ),
+        None => tracing::warn!(
+            "{ENV_APNS_TOPICS} not set — APNs registrations are not restricted to known topics"
+        ),
+    }
+
     // The gateway's provisioned did:webvh identity (push-gateway template),
     // loaded from the opened provision bundle. Present → DIDComm enabled.
     let identity = match std::env::var("GATEWAY_IDENTITY_FILE") {
@@ -79,7 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let pem = std::fs::read(&pem_path)?;
         let subject = std::env::var("GATEWAY_VAPID_SUBJECT")
             .unwrap_or_else(|_| "mailto:push-gateway@localhost".into());
-        match WebPushSender::new(pem, subject) {
+        match WebPushSender::new(pem, subject, egress.clone()) {
             Ok(s) => {
                 // Surface the public key so the operator can paste it into the
                 // device/plugin config (`pushGatewayVapidPublicKey`) — no need to
@@ -144,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Durable store when GATEWAY_STORE_FILE is set (handles/tokens survive a
     // restart); in-memory otherwise.
     let store = match std::env::var("GATEWAY_STORE_FILE") {
-        Ok(path) => Store::open(path.into()),
+        Ok(path) => Store::open(path.into(), &egress),
         Err(_) => {
             tracing::warn!(
                 "GATEWAY_STORE_FILE not set — handle registry is in-memory and lost on restart"
@@ -157,6 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         senders: Arc::new(senders),
         gateway_addr: gateway_addr.clone(),
         metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
+        egress,
     };
 
     // Start the DIDComm listener (preferred transport) if provisioned.
@@ -236,7 +256,10 @@ fn vapid_keygen(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
 /// `subscription.json` is the extension service-worker's logged subscription —
 /// `{ "endpoint": …, "keys": { "p256dh": …, "auth": … } }` (copy the
 /// `[pnm push] subscription:` line). Use it to prove: wake → gateway → Web Push
-/// → the browser SW wakes and drains.
+/// → the browser SW wakes and drains. The gateway validates the registration
+/// like any other: the endpoint must be an https URL on an allowed push service
+/// host (`GATEWAY_WEBPUSH_ALLOWED_HOSTS`), so a real browser subscription works
+/// and a local or internal URL is refused.
 /// Shared core for the `test-wake*` helpers. Mints a throwaway `did:key`,
 /// registers the given platform `registration` under it (so it's the
 /// controller), provisions itself onto the allowlist, then fires a signed
@@ -378,8 +401,10 @@ async fn test_wake(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 /// `test-wake-apns <gateway-url> <apns-token-hex> <topic/bundle-id> [mediator-did]`
 /// — fire a wake at a registered **APNs** device token, end to end, with no VTA.
-/// The token is the hex string the iOS app logs (and shows in its UI). Uses the
-/// **sandbox** APNs environment (development builds); edit for production.
+/// The token is the hex string the iOS app logs (and shows in its UI; 64–200 hex
+/// characters), and the topic must be listed in `GATEWAY_APNS_TOPICS` when that
+/// is set. Uses the **sandbox** APNs environment (development builds); edit for
+/// production.
 async fn test_wake_apns(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let usage =
         "usage: test-wake-apns <gateway-url> <apns-token-hex> <topic/bundle-id> [mediator-did]";

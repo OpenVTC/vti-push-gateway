@@ -12,6 +12,10 @@ use crate::egress::EgressPolicy;
 
 /// Upper bound on a DID named in a request (`controllerVtaDid`, `mediator`).
 pub const MAX_DID_LEN: usize = 512;
+/// Upper bound on a handle's `allowedTriggers` list. A handle's triggers are its
+/// VTA, its mediator, and a little room to spare — 32 is far above any real
+/// policy and bounds both the stored record and the per-wake scan.
+pub const MAX_ALLOWED_TRIGGERS: usize = 32;
 /// APNs device tokens are hex; accepted length range in characters.
 pub const APNS_TOKEN_LEN: std::ops::RangeInclusive<usize> = 64..=200;
 /// Upper bound on an APNs topic (bundle id), in bytes.
@@ -160,6 +164,40 @@ impl RegisterRequest {
 pub struct WakeTriggerPolicy {
     #[serde(default)]
     pub allowed_triggers: Vec<String>,
+}
+
+impl WakeTriggerPolicy {
+    /// Bound the allowlist and drop duplicates, in place.
+    ///
+    /// The list is controller-supplied, stored verbatim, echoed back in the
+    /// response, and linearly scanned on every wake. Capping it at
+    /// [`MAX_ALLOWED_TRIGGERS`] makes that scan irrelevant and stops a
+    /// controller from growing one handle's record without bound; requiring each
+    /// entry to be a DID within [`MAX_DID_LEN`] keeps junk out of the snapshot.
+    /// Duplicates are removed rather than rejected — a repeated trigger is
+    /// harmless intent, just wasteful to store.
+    ///
+    /// Order is preserved: the allowlist is echoed back to the controller, and
+    /// re-ordering it would make the response look like a different policy than
+    /// the one submitted.
+    pub fn validate_and_normalize(&mut self) -> Result<(), &'static str> {
+        if self.allowed_triggers.len() > MAX_ALLOWED_TRIGGERS {
+            return Err("allowedTriggers must list at most 32 DIDs");
+        }
+        if !self.allowed_triggers.iter().all(|d| is_bounded_did(d)) {
+            return Err("each allowedTriggers entry must be a DID of at most 512 bytes");
+        }
+        let mut seen: Vec<&str> = Vec::with_capacity(self.allowed_triggers.len());
+        let mut deduped = Vec::with_capacity(self.allowed_triggers.len());
+        for did in &self.allowed_triggers {
+            if !seen.contains(&did.as_str()) {
+                seen.push(did);
+                deduped.push(did.clone());
+            }
+        }
+        self.allowed_triggers = deduped;
+        Ok(())
+    }
 }
 
 /// `push/provision/0.2` payload — set a handle's allowlist.

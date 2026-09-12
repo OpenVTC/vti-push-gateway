@@ -148,6 +148,14 @@ cargo run
 # GATEWAY_DID_NETWORK_TIMEOUT_MS=10000  per-resolution timeout (SDK default 5000)
 # GATEWAY_DID_RESOLVER_URL=wss://…      resolve via a remote resolver service
 #                       instead of locally (unset = local resolution)
+# GATEWAY_DID_ALLOW_PRIVATE_HOSTS=1     let did:web/did:webvh resolution reach
+#                       non-public hosts (loopback, RFC 1918, link-local).
+#                       Default off: a DID names the host its document is
+#                       fetched from, and inbound DIDComm senders choose the
+#                       DIDs the gateway resolves. Needed only for a local
+#                       stack whose VTA/mediator DIDs are
+#                       did:webvh:{SCID}:localhost%3A3000 — without it those
+#                       resolve as BlockedHost.
 # RUST_LOG=vti_push_gateway=debug
 ```
 

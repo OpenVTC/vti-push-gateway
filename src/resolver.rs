@@ -9,15 +9,38 @@
 //! takes via `ListenerConfig.tdk_config` (replacing the implicit
 //! `TDKConfig::headless()`).
 //!
+//! ## Which hosts resolution may contact
+//!
+//! A `did:web`/`did:webvh` identifier *is* a network location: everything after
+//! the method prefix is the host the DID document (or verifiable log) is fetched
+//! from. On the DIDComm path the gateway resolves DIDs it did not choose — every
+//! authcrypt sender that reaches it through the mediator — so an inbound message
+//! naming `did:webvh:{SCID}:169.254.169.254` or an internal host would otherwise
+//! make the gateway issue that request from inside its own network.
+//!
+//! `affinidi-did-resolver-cache-sdk` 0.8.37 defaults to
+//! [`HostPolicy::PublicOnly`], which refuses loopback, private, CGNAT,
+//! link-local and other non-public hosts — both when the DID names one directly
+//! and when a public-looking name resolves to one. This module keeps that
+//! default and exposes one opt-out for local development, where the gateway's own
+//! identity and its mediator are typically `did:webvh:{SCID}:localhost%3A3000`
+//! and resolution would otherwise fail with `BlockedHost`.
+//!
 //! Env knobs (all optional; defaults below):
 //! - `GATEWAY_DID_CACHE_CAPACITY`   — max cached DID docs (default 250)
 //! - `GATEWAY_DID_CACHE_TTL_SECS`   — cache entry TTL (default 900 = 15 min)
 //! - `GATEWAY_DID_NETWORK_TIMEOUT_MS` — per-resolution timeout (default 10000)
 //! - `GATEWAY_DID_RESOLVER_URL`     — resolve via a remote resolver service
 //!   (`ws[s]://…`) instead of locally; unset = local resolution.
+//! - `GATEWAY_DID_ALLOW_PRIVATE_HOSTS` — allow did:web/did:webvh resolution to
+//!   non-public hosts (default off). For local stacks only.
 
 use affinidi_did_resolver_cache_sdk::config::{DIDCacheConfig, DIDCacheConfigBuilder};
+use affinidi_did_resolver_cache_sdk::network_resolvers::HostPolicy;
 use affinidi_tdk::common::config::TDKConfig;
+
+/// Env var opting resolution out of the public-host-only default.
+pub const ENV_ALLOW_PRIVATE_DID_HOSTS: &str = "GATEWAY_DID_ALLOW_PRIVATE_HOSTS";
 
 /// Resolved DID-resolver tuning (post-env).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +50,9 @@ pub struct ResolverTuning {
     pub network_timeout_ms: u32,
     /// Remote resolver service address (`ws[s]://…`); `None` = local resolution.
     pub service_address: Option<String>,
+    /// Whether did:web/did:webvh resolution may contact non-public hosts.
+    /// `false` (the default) is [`HostPolicy::PublicOnly`].
+    pub allow_private_did_hosts: bool,
 }
 
 impl Default for ResolverTuning {
@@ -39,6 +65,10 @@ impl Default for ResolverTuning {
             cache_ttl_secs: 900,
             network_timeout_ms: 10_000,
             service_address: None,
+            // Secure default: a DID that names a private or loopback host is
+            // refused, because inbound DIDComm senders choose the DIDs the
+            // gateway resolves.
+            allow_private_did_hosts: false,
         }
     }
 }
@@ -56,6 +86,16 @@ impl ResolverTuning {
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty()),
+            allow_private_did_hosts: env_flag(ENV_ALLOW_PRIVATE_DID_HOSTS),
+        }
+    }
+
+    /// The host policy resolution runs under.
+    fn host_policy(&self) -> HostPolicy {
+        if self.allow_private_did_hosts {
+            HostPolicy::AllowPrivate
+        } else {
+            HostPolicy::PublicOnly
         }
     }
 
@@ -63,7 +103,11 @@ impl ResolverTuning {
         let mut builder = DIDCacheConfigBuilder::default()
             .with_cache_capacity(self.cache_capacity)
             .with_cache_ttl(self.cache_ttl_secs)
-            .with_network_timeout(self.network_timeout_ms);
+            .with_network_timeout(self.network_timeout_ms)
+            // Explicit rather than implicit: this is the same value the builder
+            // defaults to, stated here so the gateway's stance is visible at the
+            // one place it configures resolution.
+            .with_host_policy(self.host_policy());
         if let Some(addr) = &self.service_address {
             builder = builder.with_network_mode(addr);
         }
@@ -85,13 +129,30 @@ impl ResolverTuning {
     /// One-line summary for the startup log.
     pub fn summary(&self) -> String {
         format!(
-            "cache_capacity={} cache_ttl={}s network_timeout={}ms resolver={}",
+            "cache_capacity={} cache_ttl={}s network_timeout={}ms resolver={} did_hosts={}",
             self.cache_capacity,
             self.cache_ttl_secs,
             self.network_timeout_ms,
-            self.service_address.as_deref().unwrap_or("local")
+            self.service_address.as_deref().unwrap_or("local"),
+            if self.allow_private_did_hosts {
+                "private-allowed"
+            } else {
+                "public-only"
+            }
         )
     }
+}
+
+/// Parse a boolean env flag: set to `1`/`true`/`yes`/`on` enables it.
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// Parse a `u32` env var, logging and falling back to `default` when unset or
@@ -138,6 +199,38 @@ mod tests {
         assert!(d.cache_ttl_secs > 300);
         assert!(d.network_timeout_ms > 5000);
         assert!(d.service_address.is_none()); // local by default
+    }
+
+    /// The gateway resolves DIDs chosen by inbound DIDComm senders, so the
+    /// default must be the public-only policy — and must be visible in the
+    /// startup log.
+    #[test]
+    fn did_host_policy_defaults_to_public_only() {
+        let d = ResolverTuning::default();
+        assert!(!d.allow_private_did_hosts);
+        assert_eq!(d.host_policy(), HostPolicy::PublicOnly);
+        assert!(
+            d.summary().contains("did_hosts=public-only"),
+            "{}",
+            d.summary()
+        );
+    }
+
+    /// The local-development opt-in flips the policy, and says so in the log.
+    #[test]
+    fn private_did_hosts_opt_in_is_visible() {
+        let t = ResolverTuning {
+            allow_private_did_hosts: true,
+            ..ResolverTuning::default()
+        };
+        assert_eq!(t.host_policy(), HostPolicy::AllowPrivate);
+        assert!(
+            t.summary().contains("did_hosts=private-allowed"),
+            "{}",
+            t.summary()
+        );
+        // Both policies build a usable config.
+        assert!(t.tdk_config().is_ok());
     }
 
     #[test]

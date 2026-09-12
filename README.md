@@ -130,6 +130,10 @@ cargo run
 #                       account (Firebase) → enables the FCM sender
 # GATEWAY_STORE_FILE=./gateway-store.json   persist the handle registry to this
 #                       JSON snapshot (survives restart). Omit = in-memory.
+#                       Written owner-only (0600); it holds raw push tokens.
+# GATEWAY_STRICT_KEY_PERMS=1   refuse to start when a secret file (identity,
+#                       VAPID key, APNs .p8, FCM service account) is readable
+#                       beyond its owner. Unset = warn only.
 # Egress / endpoint policy (all optional):
 # GATEWAY_WEBPUSH_ALLOWED_HOSTS=@default,push.example.org,*.up.example.net
 #                       Web Push services a registration may target. Unset = the
@@ -271,8 +275,25 @@ Trust Task is pulled from the mediator.
   are re-checked before being placed in the request path. This closes the
   register-driven SSRF and redirect/timeout exposure (SEC-4045 PG-1 / PG-5 /
   PG-N2).
-- **Persisted tokens are cleartext.** When `GATEWAY_STORE_FILE` is set the raw
-  tokens/subscriptions are written to that JSON file in cleartext; protect it
-  with filesystem permissions. At-rest hardening is tracked separately.
+- **Persisted tokens are cleartext, in an owner-only file.** When
+  `GATEWAY_STORE_FILE` is set, the raw device tokens and Web Push subscriptions
+  (`endpoint` + `p256dh` + `auth`) are written to that JSON snapshot in
+  cleartext. Treat the file as a credential store, not a cache: those values are
+  bearer secrets, and because `push/register` is anonymous, anyone who reads them
+  can re-register those devices under a controller DID of their own and wake or
+  track them. The gateway therefore writes the snapshot through a private
+  temporary file (mode 0600, unpredictable name, `O_EXCL`, `fsync` before the
+  rename) and tightens an existing snapshot to 0600 when it opens one that is
+  group- or world-readable — with a warning, because anything already leaked
+  stays leaked and those devices should be re-registered. Encryption at rest is
+  tracked separately; it protects backups and detached volumes, not a host
+  compromise.
+- **Secret files are permission-checked on read.** The identity file, VAPID key,
+  APNs `.p8` and FCM service-account JSON are read through one helper that warns
+  when a file is group- or world-accessible, and refuses to read it when
+  `GATEWAY_STRICT_KEY_PERMS=1` — so a mis-installed key fails the deployment
+  instead of a log line nobody reads. `vapid-keygen` creates the key with
+  `create_new` at mode 0600 in a single step, so there is no window in which the
+  private key is world-readable and no path for a pre-planted symlink.
 - `POST /trust-tasks` bodies are capped at 16 KiB, and each registration field
   is bounded. Rate limiting and per-handle caps are tracked separately.

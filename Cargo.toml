@@ -63,10 +63,15 @@ url = "2"
 # the tree via rustls) so the vulnerable `rsa` crate (Marvin Attack,
 # RUSTSEC-2023-0071) never enters — same "no rsa" stance as VAPID/APNs above.
 aws-lc-rs = "1"
+# The store snapshot holds raw push tokens, so it is written through a private
+# temp file: `NamedTempFile::new_in` gives an O_EXCL, mode-0600, unpredictably
+# named file in the target directory, which a `with_extension("json.tmp")` path
+# could not (guessable name, umask permissions). Was a dev-dependency until the
+# snapshot write started using it.
+tempfile = "3"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
-tempfile = "3"
 # Paused-clock tests for the wake send timeout.
 tokio = { version = "1", features = ["test-util"] }

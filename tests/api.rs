@@ -14,11 +14,12 @@ use rand::Rng;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use vti_push_gateway::api::{metrics_router, router, AppState};
+use vti_push_gateway::api::{metrics_router, router, AppState, DEFAULT_METRICS_BIND};
 use vti_push_gateway::egress::EgressPolicy;
 use vti_push_gateway::limits::{Limits, RateConfig, DEFAULT_HTTP, DEFAULT_PER_DID};
-use vti_push_gateway::sender::{EchoSender, PushSender, SendOutcome};
+use vti_push_gateway::sender::{generate_vapid_keypair, EchoSender, PushSender, SendOutcome};
 use vti_push_gateway::store::{Store, StoreLimits};
+use vti_push_gateway::types::{PushRegistration, WakeTriggerPolicy, WebPushKeys};
 
 const ED25519_MULTICODEC: [u8; 2] = [0xed, 0x01];
 const PUSH_REGISTER: &str = "https://trusttasks.org/spec/push/register/0.2";
@@ -1007,4 +1008,279 @@ async fn repeated_registration_of_one_token_is_capped() {
         }
     }
     assert_eq!(accepted, 2, "one token gets max_per_token handles, no more");
+}
+
+// ─── SEC-4045 regression gates ─────────────────────────────────────────────
+//
+// Everything below re-runs a reproduced PoC step against the merged fix. The
+// two gates that use sockets bind **loopback only**, and they assert on a
+// listener that accepted nothing: that way, reverting the fix to watch the gate
+// go red makes the gateway dial 127.0.0.1 and nothing else. No vector here can
+// send a packet off the machine, red or green — the unroutable hosts the PoC
+// also tried (`169.254.169.254` and friends) are gated in `egress::tests`,
+// which performs no I/O at all.
+
+/// Bind a loopback port that counts accepted connections and answers nothing.
+/// Standing in for `poc-harness/listener.py`: the point is the count, since a
+/// gate here passes only when it stays at zero.
+async fn counting_listener() -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = accepted.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            held.push(sock);
+        }
+    });
+    (addr, accepted)
+}
+
+/// A real Web Push sender with a throwaway VAPID key — so the wake path runs
+/// the production HTTP client rather than `EchoSender`.
+fn real_webpush_sender(egress: Arc<EgressPolicy>) -> Box<dyn PushSender> {
+    let (pem, _public) = generate_vapid_keypair().expect("VAPID keypair");
+    Box::new(
+        vti_push_gateway::sender::WebPushSender::new(
+            pem.into_bytes(),
+            "mailto:ops@gw".into(),
+            egress,
+        )
+        .expect("WebPushSender::new"),
+    )
+}
+
+/// PG-1, the PoC's whole chain as one gate — and the one the remediation plan
+/// asked for by name: a stored record whose endpoint is an internal service
+/// (the `sub-ssrf.json` shape, planted by `Store::insert` the way a pre-fix
+/// build would have), provisioned, then woken through the router with a **real**
+/// `WebPushSender`. `03_ssrf_capture.log` is the PoC's proof that this reached
+/// the listener; the gate is that it no longer does.
+///
+/// `sender::tests::production_policy_never_dials_loopback` makes the same point
+/// one layer down. This one is at the dispatch level, so it also pins the wake
+/// path's *reported* outcome: a refused endpoint counts as a transient failure,
+/// never as `delivered`.
+#[tokio::test]
+async fn wake_to_a_stored_internal_endpoint_never_dials() {
+    let vta = signing_key();
+    let trigger = signing_key();
+    let (listener_addr, accepted) = counting_listener().await;
+
+    // The PoC endpoint, pointed at the listener this test actually owns.
+    let endpoint = format!("http://{listener_addr}/latest/meta-data/iam/security-credentials/");
+    let store = Store::new();
+    store
+        .insert(
+            "legacy-handle".into(),
+            PushRegistration::Webpush {
+                endpoint: endpoint.clone(),
+                keys: WebPushKeys {
+                    p256dh: P256DH.into(),
+                    auth: AUTH.into(),
+                },
+            },
+            did_key_for(&vta),
+        )
+        .expect("a pre-fix record goes in unvalidated");
+    store.provision(
+        "legacy-handle",
+        &did_key_for(&vta),
+        WakeTriggerPolicy {
+            allowed_triggers: vec![did_key_for(&trigger)],
+        },
+    );
+
+    let egress = Arc::new(EgressPolicy::default());
+    let mut st = state_with(store, Limits::permissive());
+    st.egress = egress.clone();
+    st.senders = Arc::new(vec![real_webpush_sender(egress)]);
+    let app = router(st.clone());
+    let metrics_app = metrics_router(st, None);
+
+    let wake = tt_doc(PUSH_WAKE, json!({ "handle": "legacy-handle", "v": 1 }));
+    let out = body_json(
+        app.clone()
+            .oneshot(post(&wake, Some(&trigger)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        !is_success(&out),
+        "a wake to a non-allowlisted endpoint must fail: {out}"
+    );
+
+    // The listener is the assertion that matters: the send was refused before a
+    // socket was opened, not merely reported as failed afterwards.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        accepted.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the internal service must not be contacted"
+    );
+
+    let text = metrics_text(&metrics_app).await;
+    assert!(
+        text.contains("gateway_wake_total{outcome=\"transient_failure\"} 1\n"),
+        "a refused endpoint is a transient failure: {text}"
+    );
+    assert!(
+        text.contains("gateway_wake_total{outcome=\"delivered\"} 0\n"),
+        "nothing was delivered: {text}"
+    );
+}
+
+/// The PoC used the *difference* between refusals as a port scanner: an open
+/// port answered 200, a 404 path answered 404, a closed port refused the
+/// connection, and a redirector pivoted elsewhere (`sub-ssrf.json`,
+/// `sub-ssrf-404.json`, `sub-ssrf-closed.json`, `sub-redirect.json`). Register
+/// now refuses all four *identically*, so there is no oracle left: the reason is
+/// one fixed string, and nothing about the target — host, port or path — comes
+/// back in the response document.
+///
+/// No socket is involved at either end of this gate, which is the point: it
+/// stays hermetic whether the guard is in place or reverted.
+#[tokio::test]
+async fn register_refusals_reveal_nothing_about_the_target() {
+    // Verbatim from poc-harness/*.json.
+    let fixtures = [
+        "http://127.0.0.1:9099/latest/meta-data/iam/security-credentials/",
+        "http://127.0.0.1:9099/probe-404",
+        "http://127.0.0.1:6379/",
+        "http://127.0.0.1:9098/only-this-was-registered",
+    ];
+    let mut reasons = Vec::new();
+    for endpoint in fixtures {
+        let (app, metrics_app) = routers();
+        let reg = tt_doc(
+            PUSH_REGISTER,
+            json!({
+                "registration": { "platform": "webpush", "endpoint": endpoint,
+                                  "keys": { "p256dh": P256DH, "auth": AUTH } },
+                "controllerVtaDid": did_key_for(&signing_key()),
+            }),
+        );
+        let out = body_json(app.oneshot(post(&reg, None)).await.unwrap()).await;
+        assert!(!is_success(&out), "{endpoint} must be refused: {out}");
+
+        // Nothing that would let the caller tell one internal target from
+        // another — or learn that the gateway looked at all.
+        let text = out.to_string();
+        for leak in [
+            "127.0.0.1",
+            "9099",
+            "9098",
+            "6379",
+            "meta-data",
+            "security-credentials",
+            "probe-404",
+            "only-this-was-registered",
+        ] {
+            assert!(
+                !text.contains(leak),
+                "the refusal must not echo {leak:?} back: {text}"
+            );
+        }
+        assert!(
+            metrics_text(&metrics_app)
+                .await
+                .contains("gateway_register_total 0\n"),
+            "nothing must be registered for {endpoint}"
+        );
+        let message = out["payload"]["message"].clone();
+        assert!(
+            message.is_string(),
+            "the refusal must carry a message to compare: {out}"
+        );
+        reasons.push((out["payload"]["code"].clone(), message));
+    }
+    assert!(
+        reasons.windows(2).all(|w| w[0] == w[1]),
+        "every refusal must read the same, or the difference is the oracle: {reasons:?}"
+    );
+}
+
+/// `gateway_register_total` is the counter the PoC quoted as its proof that the
+/// flood landed (`07_metrics_after_poc.txt`: 206). Existing gates pin it for the
+/// endpoint-policy, field-validation, total-cap and rate-limit refusals; these
+/// are the two refusal paths they leave out.
+#[tokio::test]
+async fn refused_registrations_are_never_counted() {
+    // (1) No sender handles the platform (PG-N3): the state carries only a Web
+    // Push sender, so an APNs registration has nowhere to go.
+    let mut st = state_with(Store::new(), Limits::permissive());
+    let egress = Arc::new(EgressPolicy::default());
+    st.egress = egress.clone();
+    st.senders = Arc::new(vec![real_webpush_sender(egress)]);
+    let app = router(st.clone());
+    let metrics_app = metrics_router(st, None);
+
+    let reg = tt_doc(
+        PUSH_REGISTER,
+        json!({
+            "registration": apns_registration(1),
+            "controllerVtaDid": did_key_for(&signing_key()),
+        }),
+    );
+    let out = body_json(app.oneshot(post(&reg, None)).await.unwrap()).await;
+    assert!(!is_success(&out), "apns has no sender here: {out}");
+    assert!(
+        out.to_string()
+            .contains("no sender configured for this platform"),
+        "{out}"
+    );
+    assert!(
+        metrics_text(&metrics_app)
+            .await
+            .contains("gateway_register_total 0\n"),
+        "a platform with no sender must not be counted"
+    );
+
+    // (2) The per-token cap. `repeated_registration_of_one_token_is_capped`
+    // checks the refusals; this checks that they left the counter alone.
+    let st = state_with(
+        Store::with_limits(StoreLimits {
+            max_per_token: 2,
+            ..StoreLimits::default()
+        }),
+        Limits::permissive(),
+    );
+    let app = router(st.clone());
+    let metrics_app = metrics_router(st, None);
+    for _ in 0..6 {
+        let reg = tt_doc(
+            PUSH_REGISTER,
+            json!({
+                "registration": apns_registration(7),
+                "controllerVtaDid": did_key_for(&signing_key()),
+            }),
+        );
+        app.clone().oneshot(post(&reg, None)).await.unwrap();
+    }
+    assert!(
+        metrics_text(&metrics_app)
+            .await
+            .contains("gateway_register_total 2\n"),
+        "only the two handles that were stored may be counted"
+    );
+}
+
+/// PG-6 again, from the deployment side: moving the counters onto their own
+/// router only helps if that router's default bind is not reachable off-host.
+/// `main.rs` warns when an operator overrides it, but the default itself is the
+/// thing a refactor could quietly turn into `0.0.0.0`.
+#[test]
+fn default_metrics_bind_is_loopback() {
+    let addr: std::net::SocketAddr = DEFAULT_METRICS_BIND
+        .parse()
+        .expect("DEFAULT_METRICS_BIND must be a socket address");
+    assert!(
+        addr.ip().is_loopback(),
+        "the management listener must default to loopback, not {addr}"
+    );
 }

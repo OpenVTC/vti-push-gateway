@@ -45,10 +45,13 @@ pub struct GatewayIdentity {
 impl GatewayIdentity {
     /// Load the identity from a JSON key file (produced by opening the
     /// `push-gateway` provision bundle).
+    ///
+    /// The file holds the gateway's DIDComm private keys, so it goes through
+    /// [`crate::secretfile::read_secret_file`]: loose permissions are warned
+    /// about, or refused under `GATEWAY_STRICT_KEY_PERMS`.
     pub fn load(path: &Path) -> Result<Self, String> {
-        let raw = std::fs::read_to_string(path)
-            .map_err(|e| format!("read identity file {}: {e}", path.display()))?;
-        serde_json::from_str(&raw).map_err(|e| format!("parse identity file: {e}"))
+        let raw = crate::secretfile::read_secret_file(path, "identity file")?;
+        serde_json::from_slice(&raw).map_err(|e| format!("parse identity file: {e}"))
     }
 
     /// The gateway's DIDComm secrets (signing + key-agreement), keyed by their

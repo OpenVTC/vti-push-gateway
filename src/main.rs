@@ -23,6 +23,7 @@ use vti_push_gateway::api::{self, AppState};
 use vti_push_gateway::didcomm;
 use vti_push_gateway::egress::{EgressPolicy, ENV_APNS_TOPICS};
 use vti_push_gateway::identity::GatewayIdentity;
+use vti_push_gateway::secretfile;
 use vti_push_gateway::sender::{
     generate_vapid_keypair, ApnsSender, EchoSender, FcmSender, PushSender, WebPushSender,
 };
@@ -95,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // or apns/webpush with no credentials).
     let mut senders: Vec<Box<dyn PushSender>> = Vec::new();
     if let Ok(pem_path) = std::env::var("GATEWAY_VAPID_KEY_FILE") {
-        let pem = std::fs::read(&pem_path)?;
+        let pem = secretfile::read_secret_file(Path::new(&pem_path), "VAPID private key")?;
         let subject = std::env::var("GATEWAY_VAPID_SUBJECT")
             .unwrap_or_else(|_| "mailto:push-gateway@localhost".into());
         match WebPushSender::new(pem, subject, egress.clone()) {
@@ -114,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // APNs sender — enabled when the app publisher's auth key + ids are set.
     if let Ok(p8_path) = std::env::var("GATEWAY_APNS_KEY_FILE") {
-        let p8 = std::fs::read(&p8_path)?;
+        let p8 = secretfile::read_secret_file(Path::new(&p8_path), "APNs auth key")?;
         // Trim: a stray newline/space (common when exporting env vars) in the
         // key id or team id silently breaks the JWT → APNs 403 InvalidProviderToken.
         let key_id = std::env::var("GATEWAY_APNS_KEY_ID")
@@ -148,7 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // FCM sender — enabled when a Google service-account JSON is configured.
     if let Ok(sa_path) = std::env::var("GATEWAY_FCM_SERVICE_ACCOUNT_FILE") {
-        let sa = std::fs::read(&sa_path)?;
+        let sa = secretfile::read_secret_file(Path::new(&sa_path), "FCM service-account key")?;
         match FcmSender::new(&sa) {
             Ok(s) => {
                 tracing::warn!("FCM (Firebase Cloud Messaging) sender enabled");
@@ -222,19 +223,22 @@ async fn shutdown_signal() {
 /// (default `vapid.pem`), printing the public key the device/plugin registers.
 /// Refuses to overwrite an existing file — a clobbered key invalidates every
 /// live subscription.
+///
+/// The write is a single `create_new` + mode-0600 open, so the key is owner-only
+/// from its first byte and the refusal to overwrite is enforced by the kernel.
+/// The previous `exists()` check, then write, then `chmod` left two gaps: a race
+/// between the check and the write, and a window in which the private key sat at
+/// the umask default (typically world-readable).
 fn vapid_keygen(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let path = path.unwrap_or("vapid.pem");
-    if Path::new(path).exists() {
-        return Err(format!("{path} already exists — refusing to overwrite a VAPID key").into());
-    }
     let (pem, public) = generate_vapid_keypair()?;
-    std::fs::write(path, &pem)?;
-    // It's a private key — lock it down on unix.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    secretfile::write_owner_only_new(Path::new(path), pem.as_bytes()).map_err(|e| {
+        if Path::new(path).exists() {
+            format!("{path} already exists — refusing to overwrite a VAPID key")
+        } else {
+            e
+        }
+    })?;
     println!("Wrote VAPID private key (PKCS#8 PEM): {path}");
     println!();
     println!("VAPID public key (applicationServerKey):");

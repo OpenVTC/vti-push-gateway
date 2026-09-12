@@ -7,6 +7,7 @@ pub mod auth;
 pub mod didcomm;
 pub mod egress;
 pub mod identity;
+pub mod limits;
 pub mod metrics;
 pub mod resolver;
 pub mod secretfile;

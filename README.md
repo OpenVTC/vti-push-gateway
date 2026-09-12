@@ -162,6 +162,31 @@ cargo run
 # GATEWAY_METRICS_TOKEN=<secret>   require `Authorization: Bearer <secret>` on
 #                       the management listener. Unset = no auth (fine on
 #                       loopback).
+# Registry bounds (push/register is anonymous, so these cap what an
+# unauthenticated caller can make the gateway hold; all optional):
+# GATEWAY_UNPROVISIONED_TTL_SECS=86400   drop a handle whose VTA never
+#                       provisioned a trigger after this long. A provisioned
+#                       handle is never swept. This is the main bound on
+#                       anonymous growth; the sweeper runs every 60s.
+# GATEWAY_MAX_HANDLES=100000   total live handles before register is refused
+#                       with "gateway at capacity".
+# GATEWAY_MAX_HANDLES_PER_TOKEN=4   live handles sharing one device token /
+#                       Web Push endpoint, so one device (or one stolen token)
+#                       cannot occupy the registry.
+# GATEWAY_SNAPSHOT_FLUSH_MS=1000   minimum gap between snapshot writes.
+#                       Mutations set a dirty flag; a background flusher writes
+#                       at most this often instead of reserialising the whole
+#                       map per request.
+# Rate limits (all optional; two layers, because DIDComm bypasses HTTP
+# middleware — see the Security notes):
+# GATEWAY_REGISTER_PER_SEC=5 / GATEWAY_REGISTER_BURST=20
+#                       global budget for anonymous push/register.
+# GATEWAY_PER_DID_PER_SEC=20 / GATEWAY_PER_DID_BURST=60
+#                       budget per authenticated caller DID, for
+#                       push/provision and push/wake.
+# GATEWAY_HTTP_PER_SEC=10 / GATEWAY_HTTP_BURST=40
+#                       per-peer-IP budget on POST /trust-tasks (429 when
+#                       exceeded). HTTP transport only.
 # Egress / endpoint policy (all optional):
 # GATEWAY_WEBPUSH_ALLOWED_HOSTS=@default,push.example.org,*.up.example.net
 #                       Web Push services a registration may target. Unset = the
@@ -337,3 +362,28 @@ Trust Task is pulled from the mediator.
 - A `push/*` payload that fails to deserialise gets one fixed reason
   (`payload does not match the push/* 0.2 schema`); the serde detail goes to a
   debug log rather than back to the caller.
+- **The anonymous registration path is bounded.** `push/register` needs no
+  credentials, so it is rate-limited, capped, and expiring:
+  - **Expiry is the root-cause fix.** A freshly registered handle is inert until
+    its VTA provisions a trigger, so a handle still unprovisioned after
+    `GATEWAY_UNPROVISIONED_TTL_SECS` (default 24 h) is swept. Anonymous growth
+    becomes bounded churn instead of a monotonic leak. A provisioned handle is
+    never swept, however old.
+  - **Caps:** `GATEWAY_MAX_HANDLES` in total, and
+    `GATEWAY_MAX_HANDLES_PER_TOKEN` live handles per device token / Web Push
+    endpoint, so one token cannot occupy the registry.
+  - **Rate limits in two layers**, because the DIDComm transport — the preferred
+    one — never passes through HTTP middleware. A `tower_governor` layer limits
+    `POST /trust-tasks` per peer IP (429), and the transport-agnostic dispatch
+    core limits `register` against a global budget and `provision`/`wake` against
+    a budget keyed by the authenticated caller DID. The keyed buckets are
+    themselves reclaimed on a timer, since they are keyed by caller-chosen input.
+  - **Snapshot writes are debounced.** Mutations set a dirty flag and a
+    background flusher writes at most once per `GATEWAY_SNAPSHOT_FLUSH_MS`,
+    rather than reserialising the whole registry on every anonymous request.
+    Writes keep the temp-file + fsync + rename sequence, and a clean shutdown
+    flushes.
+- A caller that exceeds a budget gets a `trust-task-error` with
+  `rate limit exceeded; retry later`; one that hits a registry cap gets
+  `gateway at capacity` or `too many handles for this push token`. Neither
+  reveals anything about other tenants.

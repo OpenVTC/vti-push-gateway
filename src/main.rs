@@ -14,20 +14,48 @@
 //! Push *delivery* is real for Web Push (VAPID) and APNs when their credentials
 //! are configured; the dev `EchoSender` is the fallback (and FCM follows).
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
+use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 
 use vti_push_gateway::api::{self, AppState};
 use vti_push_gateway::didcomm;
 use vti_push_gateway::egress::{EgressPolicy, ENV_APNS_TOPICS};
 use vti_push_gateway::identity::GatewayIdentity;
+use vti_push_gateway::limits::Limits;
 use vti_push_gateway::secretfile;
 use vti_push_gateway::sender::{
     generate_vapid_keypair, ApnsSender, EchoSender, FcmSender, PushSender, WebPushSender,
 };
-use vti_push_gateway::store::Store;
+use vti_push_gateway::store::{Store, StoreLimits};
+
+/// Registry caps and the unprovisioned-handle TTL.
+const ENV_MAX_HANDLES: &str = "GATEWAY_MAX_HANDLES";
+const ENV_MAX_PER_TOKEN: &str = "GATEWAY_MAX_HANDLES_PER_TOKEN";
+const ENV_UNPROVISIONED_TTL_SECS: &str = "GATEWAY_UNPROVISIONED_TTL_SECS";
+/// Minimum gap between snapshot writes.
+const ENV_SNAPSHOT_FLUSH_MS: &str = "GATEWAY_SNAPSHOT_FLUSH_MS";
+
+/// How often the sweeper runs and the per-DID limiter buckets are reclaimed. Not
+/// configurable: it only affects how promptly expired handles disappear, and the
+/// TTL is the property an operator actually cares about.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Parse a positive integer env var, warning and using `default` when unset or
+/// unparseable.
+fn env_num<T: std::str::FromStr + Copy>(key: &str, default: T) -> T {
+    match std::env::var(key) {
+        Err(_) => default,
+        Ok(raw) => raw.trim().parse::<T>().unwrap_or_else(|_| {
+            tracing::warn!(%key, value = %raw, "invalid number; using the default");
+            default
+        }),
+    }
+}
 
 /// Env var enabling the dev echo sender (see where it is pushed, below).
 const ENV_DEV_ECHO_SENDER: &str = "GATEWAY_DEV_ECHO_SENDER";
@@ -198,23 +226,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Registry bounds. `push/register` is anonymous, so these are the ceilings on
+    // what an unauthenticated caller can make the gateway hold.
+    let defaults = StoreLimits::default();
+    let store_limits = StoreLimits {
+        max_handles: env_num(ENV_MAX_HANDLES, defaults.max_handles),
+        max_per_token: env_num(ENV_MAX_PER_TOKEN, defaults.max_per_token),
+        unprovisioned_ttl_secs: env_num(
+            ENV_UNPROVISIONED_TTL_SECS,
+            defaults.unprovisioned_ttl_secs,
+        ),
+    };
+    tracing::info!(
+        max_handles = store_limits.max_handles,
+        max_per_token = store_limits.max_per_token,
+        unprovisioned_ttl_secs = store_limits.unprovisioned_ttl_secs,
+        "handle registry limits"
+    );
+
     // Durable store when GATEWAY_STORE_FILE is set (handles/tokens survive a
     // restart); in-memory otherwise.
-    let store = match std::env::var("GATEWAY_STORE_FILE") {
-        Ok(path) => Store::open(path.into(), &egress),
+    let store = Arc::new(match std::env::var("GATEWAY_STORE_FILE") {
+        Ok(path) => Store::open_with_limits(path.into(), &egress, store_limits),
         Err(_) => {
             tracing::warn!(
                 "GATEWAY_STORE_FILE not set — handle registry is in-memory and lost on restart"
             );
-            Store::new()
+            Store::with_limits(store_limits)
         }
-    };
+    });
+    let limits = Arc::new(Limits::from_env());
+    tracing::info!(
+        register = ?limits.register_config(),
+        per_did = ?limits.per_did_config(),
+        http = ?limits.http_config(),
+        "rate limits"
+    );
     let state = AppState {
-        store: Arc::new(store),
+        store: store.clone(),
         senders: Arc::new(senders),
         gateway_addr: gateway_addr.clone(),
         metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
         egress,
+        limits: limits.clone(),
     };
 
     // Start the DIDComm listener (preferred transport) if provisioned.
@@ -272,17 +326,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let app = api::router(state).layer(tower_http::trace::TraceLayer::new_for_http());
+    // Background maintenance, all three cheap timers sharing one token:
+    //  - expire handles their VTA never provisioned (the root-cause bound on
+    //    anonymous growth),
+    //  - write the debounced snapshot,
+    //  - reclaim per-DID limiter buckets, which are keyed by caller-chosen input
+    //    and would otherwise be their own growth vector.
+    let maintenance = CancellationToken::new();
+    let flush_every = Duration::from_millis(env_num(ENV_SNAPSHOT_FLUSH_MS, 1_000));
+    tokio::spawn(
+        store
+            .clone()
+            .sweep_loop(MAINTENANCE_INTERVAL, maintenance.clone()),
+    );
+    tokio::spawn(store.clone().flush_loop(flush_every, maintenance.clone()));
+    {
+        let limits = limits.clone();
+        let shutdown = maintenance.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(MAINTENANCE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => limits.shrink(),
+                    _ = shutdown.cancelled() => return,
+                }
+            }
+        });
+    }
+
+    // Per-peer-IP HTTP limit: an outer guard that sheds a flood with 429 before
+    // the body is read, complementing the in-core limiters (which are the ones
+    // that also cover DIDComm). `GovernorConfigBuilder::period` is a replenish
+    // *interval*, so it is derived from the per-second rate rather than passed
+    // straight through. `PeerIpKeyExtractor` is why the service below is built
+    // with `into_make_service_with_connect_info`; behind a trusted reverse proxy
+    // `SmartIpKeyExtractor` would read `X-Forwarded-For` instead, which is only
+    // sound when that proxy is the sole ingress.
+    let http = limits.http_config();
+    let governor = GovernorConfigBuilder::default()
+        .period(Duration::from_nanos(
+            1_000_000_000 / u64::from(http.per_second.max(1)),
+        ))
+        .burst_size(http.burst.max(1))
+        .finish()
+        .ok_or("invalid per-IP HTTP rate-limit configuration")?;
+
+    let app = api::router(state)
+        .layer(GovernorLayer::new(Arc::new(governor)))
+        .layer(tower_http::trace::TraceLayer::new_for_http());
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::warn!(
         %bind, %gateway_addr,
         "vti-push-gateway up"
     );
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
+    // Stop the timers, then take one last snapshot so a clean shutdown is
+    // durable even if the change landed inside the final flush window.
+    maintenance.cancel();
     didcomm_shutdown.cancel();
+    store.flush();
     Ok(())
 }
 

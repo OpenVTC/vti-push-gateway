@@ -26,6 +26,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      # libdbus-sys builds against the system D-Bus headers (the secret-service
+      # backend behind the keyring). Hosted runners do not ship them.
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
       # GitHub-hosted runners ship rustup; select a pinned toolchain with the
       # components we need rather than using a third-party toolchain action.
       - name: Install Rust toolchain

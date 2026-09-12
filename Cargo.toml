@@ -38,7 +38,13 @@ uuid = { version = "1", features = ["v4"] }
 affinidi-messaging-didcomm-service = "0.7"
 affinidi-tdk = "0.13"
 affinidi-secrets-resolver = "0.5"
-affinidi-did-resolver-cache-sdk = { version = "0.8", features = ["network"] }
+# 0.8.37 is a floor, not cosmetic: it is the first release whose did:web **and**
+# did:webvh resolvers refuse non-public hosts by default (didwebvh-rs 0.7's
+# `HostPolicy`). A DID names the host its document is fetched from, and the
+# DIDComm transport resolves DIDs chosen by whoever sends the gateway a message,
+# so resolving below this floor would reintroduce a resolver-side SSRF. Pinning
+# the patch stops a fresh `cargo update` from resolving back under it.
+affinidi-did-resolver-cache-sdk = { version = "0.8.37", features = ["network"] }
 tokio-util = "0.7"
 # Async push senders (real delivery — Web Push / APNs — is async HTTP).
 async-trait = "0.1"

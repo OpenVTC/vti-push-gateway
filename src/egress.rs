@@ -727,4 +727,75 @@ mod tests {
             .expect_err("https_only must refuse http");
         assert!(err.is_builder(), "{err:?}");
     }
+
+    /// DNS rebinding, end to end through the client every sender uses: a *name*
+    /// — not an IP literal, which [`EgressPolicy::validate_webpush_endpoint`]
+    /// already refuses — that resolves to a non-public address must be refused
+    /// **before** a socket is opened.
+    ///
+    /// `guarded_resolver_refuses_loopback_names` checks the resolver on its own.
+    /// This checks that [`hardened_client_builder`] actually installs it, that
+    /// the refusal is the resolver's rather than an incidental TLS or
+    /// connection-refused failure, and that it lands before the dial — a live
+    /// listener is the only witness that can tell "refused" from "tried and
+    /// failed".
+    ///
+    /// `localhost` is the entire vector set here on purpose. This gate binds a
+    /// real socket, so reverting the guard to watch it go red must dial
+    /// 127.0.0.1 and nothing else; the link-local (cloud-metadata) and
+    /// private-range hosts the PoC also aimed at are gated by
+    /// `is_public_ip_table`, which opens no socket at all.
+    #[tokio::test]
+    async fn hardened_client_refuses_a_name_that_resolves_to_loopback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(sock);
+            }
+        });
+
+        let client = hardened_client_builder(&EgressPolicy::default())
+            .build()
+            .unwrap();
+        let started = Instant::now();
+        let err = client
+            .get(format!("https://localhost:{port}/sub"))
+            .send()
+            .await
+            .expect_err("a name resolving to loopback must be refused");
+        let elapsed = started.elapsed();
+
+        // Walk the source chain: the refusal must be `BlockedAddress`, not
+        // something that merely looks like it from the outside.
+        let mut chain = err.to_string();
+        let mut source: Option<&(dyn std::error::Error + 'static)> =
+            std::error::Error::source(&err);
+        while let Some(e) = source {
+            chain.push_str(" / ");
+            chain.push_str(&e.to_string());
+            source = e.source();
+        }
+        assert!(
+            chain.contains("non-public address"),
+            "the guarded resolver must be what refused: {chain}"
+        );
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "the refusal must precede the dial"
+        );
+        assert!(
+            elapsed < PUSH_CONNECT_TIMEOUT,
+            "a refusal is a lookup, not a connect attempt: took {elapsed:?}"
+        );
+    }
 }

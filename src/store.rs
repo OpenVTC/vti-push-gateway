@@ -1105,4 +1105,75 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o600, "rewritten snapshot must stay 0600");
     }
+
+    /// The snapshot's mode across the whole lifecycle, for every way an older
+    /// build could have left it loose — not only the 0644 that a umask of 022
+    /// happens to produce, which is all `open_tightens_a_world_readable_snapshot`
+    /// covers.
+    ///
+    /// `05_plaintext_store_snapshot.json` is the PoC's copy of this file: raw
+    /// APNs device tokens and Web Push subscription secrets in cleartext. Those
+    /// are bearer credentials and `push/register` is anonymous, so the file mode
+    /// is what stands between them and every other account on the host. The
+    /// lifecycle is: a loose file on disk → `open` tightens it → the records
+    /// still load → a mutation rewrites it → it is still owner-only. A fix that
+    /// tightened on open but let the rewrite path reintroduce the umask default
+    /// would pass the existing gates and fail this one.
+    #[test]
+    #[cfg(unix)]
+    fn every_loose_snapshot_mode_is_tightened_for_the_whole_lifecycle() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let token = "a1".repeat(32);
+        for loose in [0o604, 0o620, 0o640, 0o644, 0o660, 0o664, 0o666, 0o777] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gateway-store.json");
+            {
+                let store = open(path.clone());
+                store
+                    .insert("h1".into(), apns("a1"), CONTROLLER.into())
+                    .unwrap();
+                provision_self(&store, "h1");
+            } // drop → flush
+
+            // Stand in for the pre-fix write, which landed at the umask default.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(loose)).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().mode() & 0o777,
+                loose,
+                "the fixture itself must start loose"
+            );
+
+            let reopened = open(path.clone());
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().mode() & 0o777,
+                0o600,
+                "open must tighten a snapshot left at {loose:04o}"
+            );
+            // The tokens really are in there in cleartext, so the mode is
+            // protecting something rather than guarding an empty file.
+            assert!(
+                std::fs::read_to_string(&path).unwrap().contains(&token),
+                "the snapshot holds the raw token, so it is a secret file"
+            );
+            assert!(
+                matches!(
+                    reopened.authorize_wake("h1", "did:key:zT"),
+                    WakeAuthz::Allowed(_)
+                ),
+                "tightening {loose:04o} must not disturb the contents"
+            );
+
+            // And the rewrite that follows the next mutation stays owner-only.
+            reopened
+                .insert("h2".into(), apns("b2"), CONTROLLER.into())
+                .unwrap();
+            assert!(reopened.flush(), "the second registration is written");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().mode() & 0o777,
+                0o600,
+                "the rewrite after tightening {loose:04o} must stay 0600"
+            );
+        }
+    }
 }

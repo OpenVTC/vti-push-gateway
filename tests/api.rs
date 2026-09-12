@@ -1072,7 +1072,14 @@ async fn wake_to_a_stored_internal_endpoint_never_dials() {
     let (listener_addr, accepted) = counting_listener().await;
 
     // The PoC endpoint, pointed at the listener this test actually owns.
-    let endpoint = format!("http://{listener_addr}/latest/meta-data/iam/security-credentials/");
+    //
+    // `https`, deliberately. With `http` the hardened client's `https_only`
+    // refuses the URL before the endpoint policy is consulted at all, so the
+    // gate would stay green even if the policy stopped rejecting internal
+    // hosts — it would be pinning the scheme check twice and the SSRF
+    // guard not at all. Over `https` the only thing standing between the
+    // wake and this listener is `validate_webpush_endpoint`.
+    let endpoint = format!("https://{listener_addr}/latest/meta-data/iam/security-credentials/");
     let store = Store::new();
     store
         .insert(

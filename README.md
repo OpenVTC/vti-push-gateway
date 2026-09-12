@@ -36,9 +36,13 @@ self-hostable, no Apple/Google account), a real **APNs** sender
 background push), a real **FCM** sender (`GATEWAY_FCM_SERVICE_ACCOUNT_FILE`;
 FCM HTTP v1, OAuth2 access token from an RS256 service-account assertion signed
 with `aws-lc-rs` — no `rsa` crate; data-only high-priority wake), and a dev
-**echo sender** (logs, delivers nothing) as the fallback. The handle registry
-is in-memory by default, or **durable** via a JSON snapshot when
-`GATEWAY_STORE_FILE` is set (handles/tokens survive a restart).
+**echo sender** (logs, delivers nothing) behind `GATEWAY_DEV_ECHO_SENDER=1`.
+The echo sender is opt-in rather than a fallback: it accepts *every* platform,
+so whenever it is registered a wake for a platform with no credentials reports
+`delivered` without sending anything. With it off, such a `push/register` is
+refused outright. The handle registry is in-memory by default, or **durable**
+via a JSON snapshot when `GATEWAY_STORE_FILE` is set (handles/tokens survive a
+restart).
 
 **DIDComm transport (preferred)** is wired: when `GATEWAY_IDENTITY_FILE`
 provides the gateway's provisioned `did:webvh` identity, a `DIDCommService`
@@ -51,7 +55,12 @@ then open the bundle into the identity file.
 **Metrics** are exposed at `GET /metrics` in Prometheus text-exposition format
 (`gateway_register_total`, `gateway_provision_total{outcome}`,
 `gateway_wake_total{outcome}`) — counted in the transport-agnostic dispatch core,
-so both HTTPS and DIDComm wakes are covered.
+so both HTTPS and DIDComm wakes are covered. They are served on a **separate
+management listener**, `GATEWAY_METRICS_BIND` (default `127.0.0.1:9300`), and not
+on the public router: the counters describe a push fleet's volumes and failure
+modes, and a reverse proxy that forwards `location /` wholesale would otherwise
+publish them. Set `GATEWAY_METRICS_TOKEN` to require a bearer token when the
+management port has to be reachable off-host.
 
 The **DID resolver** on the DIDComm path is tunable for `did:webvh` (whose
 resolution fetches a verifiable log over HTTPS — slower than `did:key`/`did:web`,
@@ -72,7 +81,14 @@ A single Trust-Task endpoint dispatches by the document's `type`:
 | POST   | `/trust-tasks`  | `push/provision/0.2`  | controller VTA | did-signed |
 | POST   | `/trust-tasks`  | `push/wake/0.2`       | trigger (mediator/VTA) | did-signed |
 | GET    | `/healthz`      | —                     | — | none |
-| GET    | `/metrics`      | —                     | scraper | none |
+
+On the **management** listener (`GATEWAY_METRICS_BIND`, default
+`127.0.0.1:9300`) — never on the public one:
+
+| Method | Path            | `type`                | Caller | Auth |
+|--------|-----------------|-----------------------|--------|------|
+| GET    | `/metrics`      | —                     | scraper | optional bearer (`GATEWAY_METRICS_TOKEN`) |
+| GET    | `/healthz`      | —                     | — | none |
 
 Success returns a `…#response` Trust Task document; failure returns a
 `trust-task-error/0.1` document (the envelope carries the outcome).
@@ -134,6 +150,18 @@ cargo run
 # GATEWAY_STRICT_KEY_PERMS=1   refuse to start when a secret file (identity,
 #                       VAPID key, APNs .p8, FCM service account) is readable
 #                       beyond its owner. Unset = warn only.
+# GATEWAY_DEV_ECHO_SENDER=1   register the dev echo sender (logs, delivers
+#                       nothing). Opt-in: it accepts EVERY platform, so it makes
+#                       wakes for unconfigured platforms report `delivered`
+#                       without sending. Use it for a credential-free dev
+#                       gateway; never in production.
+# Management listener (metrics), separate from the public bind:
+# GATEWAY_METRICS_BIND=127.0.0.1:9300   where GET /metrics is served. Keep it on
+#                       loopback; a non-loopback value with no token logs a
+#                       warning at startup.
+# GATEWAY_METRICS_TOKEN=<secret>   require `Authorization: Bearer <secret>` on
+#                       the management listener. Unset = no auth (fine on
+#                       loopback).
 # Egress / endpoint policy (all optional):
 # GATEWAY_WEBPUSH_ALLOWED_HOSTS=@default,push.example.org,*.up.example.net
 #                       Web Push services a registration may target. Unset = the
@@ -296,4 +324,16 @@ Trust Task is pulled from the mediator.
   `create_new` at mode 0600 in a single step, so there is no window in which the
   private key is world-readable and no path for a pre-planted symlink.
 - `POST /trust-tasks` bodies are capped at 16 KiB, and each registration field
-  is bounded. Rate limiting and per-handle caps are tracked separately.
+  is bounded. A handle's `allowedTriggers` list is capped at 32 entries, each of
+  which must be a DID of at most 512 bytes; duplicates are collapsed. Rate
+  limiting and per-handle caps are tracked separately.
+- **The operation counters are not on the public listener.** `GET /metrics` is
+  served only on `GATEWAY_METRICS_BIND` (loopback by default), optionally behind
+  `GATEWAY_METRICS_TOKEN`, so a proxy forwarding `location /` cannot expose them.
+- **The dev echo sender is opt-in** (`GATEWAY_DEV_ECHO_SENDER=1`). It handles
+  every platform, so leaving it on in production would mean wakes for a platform
+  with no configured credentials are reported `delivered` without a push ever
+  being sent — a dropped wake that looks like a successful one.
+- A `push/*` payload that fails to deserialise gets one fixed reason
+  (`payload does not match the push/* 0.2 schema`); the serde detail goes to a
+  debug log rather than back to the caller.

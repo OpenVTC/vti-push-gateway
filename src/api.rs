@@ -19,8 +19,12 @@ use std::time::Duration;
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, State},
-    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
+    extract::{DefaultBodyLimit, Request, State},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, StatusCode,
+    },
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
@@ -46,6 +50,21 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
 /// per-sender client timeout.
 pub const WAKE_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Env var setting the address the management (metrics) listener binds to.
+pub const ENV_METRICS_BIND: &str = "GATEWAY_METRICS_BIND";
+/// Default management bind address — loopback, so counters are not public.
+pub const DEFAULT_METRICS_BIND: &str = "127.0.0.1:9300";
+/// Env var setting a bearer token the metrics listener requires.
+pub const ENV_METRICS_TOKEN: &str = "GATEWAY_METRICS_TOKEN";
+
+/// The single reason returned when a `push/*` payload does not deserialise.
+///
+/// Deliberately fixed: the caller learns that its document did not match the
+/// schema, and the serde detail (which names fields and types, and echoes back
+/// parts of the input) goes to a `debug!` log instead. The schema itself is
+/// public, so this is hygiene rather than a vulnerability — see the PR.
+const SCHEMA_MISMATCH: &str = "payload does not match the push/* 0.2 schema";
+
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Store>,
@@ -58,13 +77,67 @@ pub struct AppState {
     pub egress: Arc<EgressPolicy>,
 }
 
+/// The **public** router: the `push/*` Trust-Task endpoint and a liveness probe.
+///
+/// `/metrics` is deliberately absent — see [`metrics_router`].
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/trust-tasks", post(trust_tasks))
         .route("/healthz", get(|| async { "ok" }))
-        .route("/metrics", get(metrics))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
+}
+
+/// The **management** router, served on its own listener ([`ENV_METRICS_BIND`],
+/// loopback by default).
+///
+/// The counters name handle, provision and wake volumes and their failure
+/// outcomes. That is operational intelligence about a push fleet, and it shared a
+/// listener with the public API — so anything fronting the gateway (an nginx
+/// vhost proxying `location /` wholesale, as the vti-setup template does) exposed
+/// it to the internet. Separating the listener means the deployment cannot leak
+/// it by accident; the optional [`ENV_METRICS_TOKEN`] bearer token is for when
+/// the management port must be reachable off-host.
+pub fn metrics_router(state: AppState, token: Option<String>) -> Router {
+    let mut router = Router::new()
+        .route("/metrics", get(metrics))
+        .route("/healthz", get(|| async { "ok" }));
+    if let Some(expected) = token {
+        let expected: Arc<str> = expected.into();
+        router = router.layer(middleware::from_fn(move |req, next| {
+            require_bearer(expected.clone(), req, next)
+        }));
+    }
+    router
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .with_state(state)
+}
+
+/// Gate the management router on a bearer token.
+async fn require_bearer(expected: Arc<str>, req: Request, next: Next) -> Response {
+    let presented = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match presented {
+        Some(got) if constant_time_eq(got.as_bytes(), expected.as_bytes()) => next.run(req).await,
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            [(CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "metrics require a bearer token\n",
+        )
+            .into_response(),
+    }
+}
+
+/// Compare two byte strings without an early exit on the first difference, so
+/// the response time does not reveal a correct prefix of the token.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// `GET /metrics` — Prometheus text exposition of the operation counters.
@@ -119,15 +192,11 @@ fn malformed(doc: &TrustTask<Value>, reason: &str) -> Value {
 }
 
 /// Parse `doc.payload` into the typed body, or return a `malformed_request`
-/// error document.
+/// error document carrying the fixed [`SCHEMA_MISMATCH`] reason.
 fn parse<T: serde::de::DeserializeOwned>(doc: &TrustTask<Value>) -> Result<T, Value> {
     serde_json::from_value(doc.payload.clone()).map_err(|e| {
-        reject_value(
-            doc,
-            RejectReason::MalformedRequest {
-                reason: format!("payload: {e}"),
-            },
-        )
+        tracing::debug!(error = %e, type_uri = %doc.type_uri, "push/* payload failed to parse");
+        malformed(doc, SCHEMA_MISMATCH)
     })
 }
 
@@ -204,10 +273,15 @@ async fn handle_provision(
     let Some(caller) = sender else {
         return reject_value(doc, RejectReason::ProofRequired);
     };
-    let req: ProvisionRequest = match parse(doc) {
+    let mut req: ProvisionRequest = match parse(doc) {
         Ok(r) => r,
         Err(v) => return v,
     };
+    // Bound and normalise the controller-supplied allowlist before it is stored
+    // or echoed back.
+    if let Err(reason) = req.policy.validate_and_normalize() {
+        return malformed(doc, reason);
+    }
     let triggers = req.policy.allowed_triggers.clone();
     match state.store.provision(&req.handle, &caller, req.policy) {
         ProvisionOutcome::Ok => {
@@ -366,9 +440,14 @@ async fn trust_tasks(State(state): State<AppState>, headers: HeaderMap, body: By
     let doc: TrustTask<Value> = match serde_json::from_slice(&body) {
         Ok(d) => d,
         Err(e) => {
+            // Same reasoning as `parse`: a fixed reason out, the detail to logs.
+            tracing::debug!(error = %e, "request body is not a Trust Task document");
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "invalid_body", "message": e.to_string() })),
+                Json(json!({
+                    "error": "invalid_body",
+                    "message": "body is not a Trust Task document",
+                })),
             )
                 .into_response();
         }

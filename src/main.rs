@@ -29,6 +29,21 @@ use vti_push_gateway::sender::{
 };
 use vti_push_gateway::store::Store;
 
+/// Env var enabling the dev echo sender (see where it is pushed, below).
+const ENV_DEV_ECHO_SENDER: &str = "GATEWAY_DEV_ECHO_SENDER";
+
+/// Parse a boolean env flag: `1`/`true`/`yes`/`on` enables it.
+fn env_flag(key: &str) -> bool {
+    std::env::var(key)
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Dev subcommands — handled before anything else so their output isn't
@@ -158,8 +173,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => tracing::error!(error = %e, "FCM sender init failed; echo fallback"),
         }
     }
-    // Dev echo sender (logs, delivers nothing) — fallback / no-credentials case.
-    senders.push(Box::new(EchoSender));
+    // Dev echo sender (logs, delivers nothing) — **opt-in only**.
+    //
+    // It reports `handles() == true` for every platform, so whenever it is
+    // present it is a catch-all: `push/register`'s "no sender configured for this
+    // platform" gate can never fire, and a production wake for a platform whose
+    // credentials are missing reports `delivered` having sent nothing. That is
+    // the wrong answer for a delivery-critical path — a dropped wake is a
+    // security control that silently did not happen — so it now requires
+    // GATEWAY_DEV_ECHO_SENDER.
+    if env_flag(ENV_DEV_ECHO_SENDER) {
+        tracing::warn!(
+            "{ENV_DEV_ECHO_SENDER} is set — the dev echo sender accepts EVERY platform and \
+             reports wakes as delivered without sending them. Do not enable this in production."
+        );
+        senders.push(Box::new(EchoSender));
+    }
+    if senders.is_empty() {
+        tracing::error!(
+            "no push sender is configured — every push/register will be refused. Set \
+             GATEWAY_VAPID_KEY_FILE, GATEWAY_APNS_KEY_FILE or \
+             GATEWAY_FCM_SERVICE_ACCOUNT_FILE, or {ENV_DEV_ECHO_SENDER}=1 for a \
+             credential-free dev gateway."
+        );
+    }
 
     // Durable store when GATEWAY_STORE_FILE is set (handles/tokens survive a
     // restart); in-memory otherwise.
@@ -199,6 +236,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+
+    // Management surface on its own listener, loopback by default. The counters
+    // describe a push fleet's volumes and failure modes, and they used to sit on
+    // the public router — so an nginx vhost proxying `location /` wholesale (as
+    // the vti-setup template does) published them.
+    let metrics_bind =
+        std::env::var(api::ENV_METRICS_BIND).unwrap_or_else(|_| api::DEFAULT_METRICS_BIND.into());
+    let metrics_token = std::env::var(api::ENV_METRICS_TOKEN)
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    let metrics_listener = tokio::net::TcpListener::bind(&metrics_bind).await?;
+    let off_host = !metrics_listener
+        .local_addr()
+        .map(|a| a.ip().is_loopback())
+        .unwrap_or(false);
+    if off_host && metrics_token.is_none() {
+        tracing::warn!(
+            %metrics_bind,
+            "{} is not a loopback address and {} is unset — the operation counters are \
+             reachable off-host with no authentication",
+            api::ENV_METRICS_BIND,
+            api::ENV_METRICS_TOKEN
+        );
+    }
+    tracing::warn!(
+        %metrics_bind, authenticated = metrics_token.is_some(),
+        "metrics listener up (GET /metrics)"
+    );
+    let metrics_app = api::metrics_router(state.clone(), metrics_token);
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(metrics_listener, metrics_app).await {
+            tracing::error!(error = %e, "metrics listener stopped");
+        }
+    });
 
     let app = api::router(state).layer(tower_http::trace::TraceLayer::new_for_http());
     let listener = tokio::net::TcpListener::bind(&bind).await?;

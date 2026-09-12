@@ -14,7 +14,7 @@ use rand::Rng;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-use vti_push_gateway::api::{router, AppState};
+use vti_push_gateway::api::{metrics_router, router, AppState};
 use vti_push_gateway::egress::EgressPolicy;
 use vti_push_gateway::sender::{EchoSender, PushSender, SendOutcome};
 use vti_push_gateway::store::Store;
@@ -53,6 +53,14 @@ fn state() -> AppState {
     }
 }
 
+/// The public router plus a management router sharing one `AppState`, so a test
+/// can drive `push/*` and then scrape the counters those calls bumped. `/metrics`
+/// no longer lives on the public router.
+fn routers() -> (Router, Router) {
+    let st = state();
+    (router(st.clone()), metrics_router(st, None))
+}
+
 /// A syntactically valid 64-character hex APNs device token.
 fn apns_token() -> String {
     "a1".repeat(32)
@@ -63,7 +71,7 @@ const P256DH: &str =
     "BHTHkS5TN8hSA9_AzgRusH55jqrZjomGJ42mYrmFNIKH1cc0JnR6ZzwjcWQljvhdjlapl3nOtq2P6e9IMjMoWrY";
 const AUTH: &str = "-8GwtL6MnCVPpyjEYoad2A";
 
-/// Scrape `GET /metrics` through the router.
+/// Scrape `GET /metrics` through the **management** router.
 async fn metrics_text(app: &Router) -> String {
     let resp = app
         .clone()
@@ -345,12 +353,13 @@ async fn dead_token_reports_v2_token_unregistered_status() {
 
 /// The `/metrics` endpoint reflects real operation outcomes: a full
 /// register → provision → wake flow plus a refused wake show up as the right
-/// Prometheus counters, scraped through the same router.
+/// Prometheus counters, scraped through the management router that shares the
+/// public router's state.
 #[tokio::test]
 async fn metrics_endpoint_reflects_operations() {
     let vta = signing_key();
     let mediator = signing_key();
-    let app = router(state());
+    let (app, metrics_app) = routers();
 
     // register → handle.
     let reg = tt_doc(
@@ -386,7 +395,7 @@ async fn metrics_endpoint_reflects_operations() {
         .unwrap();
 
     // Scrape /metrics.
-    let text = metrics_text(&app).await;
+    let text = metrics_text(&metrics_app).await;
 
     assert!(text.contains("gateway_register_total 1\n"), "{text}");
     assert!(
@@ -432,7 +441,7 @@ async fn provision_without_auth_is_rejected() {
 /// nothing is registered (`gateway_register_total` stays 0).
 #[tokio::test]
 async fn register_ssrf_webpush_endpoint_is_rejected() {
-    let app = router(state());
+    let (app, metrics_app) = routers();
     // The exact endpoint from pocs/.../sub-ssrf.json (with the payload's own keys).
     let reg = tt_doc(
         PUSH_REGISTER,
@@ -458,7 +467,7 @@ async fn register_ssrf_webpush_endpoint_is_rejected() {
         "SSRF register must return a trust-task-error: {doc}"
     );
     assert!(
-        metrics_text(&app)
+        metrics_text(&metrics_app)
             .await
             .contains("gateway_register_total 0\n"),
         "nothing must be registered"
@@ -480,7 +489,7 @@ async fn register_rejects_invalid_fields() {
         json!({ "platform": "apns", "token": "../x", "topic": "org.openvtc.app" }),
     ];
     for reg in bad_regs {
-        let app = router(state());
+        let (app, metrics_app) = routers();
         let reg_is = reg.clone();
         let doc = tt_doc(
             PUSH_REGISTER,
@@ -488,7 +497,7 @@ async fn register_rejects_invalid_fields() {
         );
         let out = body_json(app.clone().oneshot(post(&doc, None)).await.unwrap()).await;
         assert!(!is_success(&out), "must be rejected: {reg_is} → {out}");
-        assert!(metrics_text(&app)
+        assert!(metrics_text(&metrics_app)
             .await
             .contains("gateway_register_total 0\n"));
     }
@@ -551,6 +560,207 @@ async fn oversized_body_is_rejected() {
         StatusCode::PAYLOAD_TOO_LARGE,
         "17 KiB body must be 413"
     );
+}
+
+/// PG-6: the counters are not on the public router any more — only on the
+/// management one, so a proxy forwarding `location /` wholesale cannot publish
+/// them. Liveness stays available on both.
+#[tokio::test]
+async fn metrics_is_not_served_on_the_public_router() {
+    let (app, metrics_app) = routers();
+    let get = |uri: &str| {
+        Request::builder()
+            .method("GET")
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    assert_eq!(
+        app.clone().oneshot(get("/metrics")).await.unwrap().status(),
+        StatusCode::NOT_FOUND,
+        "/metrics must not exist on the public router"
+    );
+    assert_eq!(
+        app.oneshot(get("/healthz")).await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        metrics_app.oneshot(get("/metrics")).await.unwrap().status(),
+        StatusCode::OK,
+        "the management router serves them"
+    );
+}
+
+/// With `GATEWAY_METRICS_TOKEN` configured, the management router requires that
+/// exact bearer token — for when the management port must be reachable off-host.
+#[tokio::test]
+async fn metrics_router_enforces_its_bearer_token() {
+    let app = metrics_router(state(), Some("s3cret".into()));
+    let scrape = |auth: Option<&str>| {
+        let mut b = Request::builder().method("GET").uri("/metrics");
+        if let Some(a) = auth {
+            b = b.header("authorization", a);
+        }
+        b.body(Body::empty()).unwrap()
+    };
+
+    for bad in [
+        None,
+        Some("Bearer wrong"),
+        Some("s3cret"),         // no scheme
+        Some("Bearer s3cre"),   // prefix
+        Some("Bearer s3crets"), // extension
+        Some("bearer s3cret"),  // wrong case
+    ] {
+        assert_eq!(
+            app.clone().oneshot(scrape(bad)).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "{bad:?} must be refused"
+        );
+    }
+    assert_eq!(
+        app.oneshot(scrape(Some("Bearer s3cret")))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}
+
+/// PG-4: `allowedTriggers` is capped at 32, every entry must be a DID, and
+/// duplicates collapse while order is preserved. A refused policy must leave the
+/// stored allowlist exactly as it was.
+#[tokio::test]
+async fn provision_bounds_the_allowed_triggers_list() {
+    let vta = signing_key();
+    let mediator = signing_key();
+    let app = router(state());
+
+    let reg = tt_doc(
+        PUSH_REGISTER,
+        json!({
+            "registration": { "platform": "apns", "token": apns_token(), "topic": "org.openvtc.app" },
+            "controllerVtaDid": did_key_for(&vta),
+        }),
+    );
+    let handle = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await["payload"]
+        ["wakeHandle"]["handle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A good policy first, so a later refusal can be shown to change nothing.
+    let good = tt_doc(
+        PUSH_PROVISION,
+        json!({ "handle": handle, "policy": { "allowedTriggers": [did_key_for(&mediator)] } }),
+    );
+    assert!(is_success(
+        &body_json(app.clone().oneshot(post(&good, Some(&vta))).await.unwrap()).await
+    ));
+
+    // 33 entries → refused.
+    let many: Vec<String> = (0..33).map(|_| did_key_for(&signing_key())).collect();
+    let too_many = tt_doc(
+        PUSH_PROVISION,
+        json!({ "handle": handle, "policy": { "allowedTriggers": many } }),
+    );
+    let out = body_json(
+        app.clone()
+            .oneshot(post(&too_many, Some(&vta)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(!is_success(&out), "33 triggers must be refused: {out}");
+
+    // A non-DID entry → refused.
+    let junk = tt_doc(
+        PUSH_PROVISION,
+        json!({ "handle": handle, "policy": { "allowedTriggers": ["not-a-did"] } }),
+    );
+    let out = body_json(app.clone().oneshot(post(&junk, Some(&vta))).await.unwrap()).await;
+    assert!(
+        !is_success(&out),
+        "a non-DID trigger must be refused: {out}"
+    );
+
+    // Neither refusal disturbed the stored allowlist.
+    let wake = tt_doc(PUSH_WAKE, json!({ "handle": handle, "v": 1 }));
+    let out = body_json(
+        app.clone()
+            .oneshot(post(&wake, Some(&mediator)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        is_success(&out),
+        "a refused policy must leave the allowlist intact: {out}"
+    );
+
+    // Exactly 32 is accepted (the cap is inclusive).
+    let thirty_two: Vec<String> = (0..32).map(|_| did_key_for(&signing_key())).collect();
+    let at_cap = tt_doc(
+        PUSH_PROVISION,
+        json!({ "handle": handle, "policy": { "allowedTriggers": thirty_two } }),
+    );
+    let out = body_json(
+        app.clone()
+            .oneshot(post(&at_cap, Some(&vta)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(is_success(&out), "32 triggers must be accepted: {out}");
+
+    // Duplicates collapse; the surviving order is the submitted order.
+    let a = did_key_for(&mediator);
+    let b = did_key_for(&signing_key());
+    let dupes = tt_doc(
+        PUSH_PROVISION,
+        json!({ "handle": handle, "policy": { "allowedTriggers": [&a, &b, &a] } }),
+    );
+    let out = body_json(app.oneshot(post(&dupes, Some(&vta))).await.unwrap()).await;
+    assert!(
+        is_success(&out),
+        "duplicates are collapsed, not refused: {out}"
+    );
+    assert_eq!(
+        out["payload"]["policy"]["allowedTriggers"],
+        json!([&a, &b]),
+        "duplicates collapse and order is preserved: {out}"
+    );
+}
+
+/// PG-7: a payload that does not match the schema gets one fixed reason; the
+/// serde detail goes to a debug log, not to the caller.
+#[tokio::test]
+async fn schema_mismatch_reason_is_generic() {
+    let app = router(state());
+    // `endpoint` is a number where a string belongs (RUN.md #7).
+    let reg = tt_doc(
+        PUSH_REGISTER,
+        json!({
+            "registration": { "platform": "webpush", "endpoint": 123,
+                              "keys": { "p256dh": P256DH, "auth": AUTH } },
+            "controllerVtaDid": did_key_for(&signing_key()),
+        }),
+    );
+    let out = body_json(app.oneshot(post(&reg, None)).await.unwrap()).await;
+    assert!(!is_success(&out), "must be rejected: {out}");
+
+    let text = out.to_string();
+    assert!(
+        text.contains("payload does not match the push/* 0.2 schema"),
+        "the fixed reason must be returned: {text}"
+    );
+    for leak in ["invalid type", "expected a string", "integer `123`"] {
+        assert!(
+            !text.contains(leak),
+            "serde detail {leak:?} must not be reflected: {text}"
+        );
+    }
 }
 
 #[tokio::test]

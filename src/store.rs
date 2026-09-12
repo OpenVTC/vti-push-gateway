@@ -1,5 +1,6 @@
-//! Gateway state: opaque handle → device push token (held here and nowhere
-//! else) + the controller VTA + the VTA-provisioned trigger allowlist.
+//! Gateway state: opaque handle → device push token (never disclosed to
+//! triggers or the VTA) + the controller VTA + the VTA-provisioned trigger
+//! allowlist.
 //!
 //! In-memory by default; **optionally durable** via a JSON snapshot file
 //! (`Store::open`): the map is loaded on boot and atomically rewritten after
@@ -14,12 +15,15 @@ use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{PushRegistration, WakeTriggerPolicy};
+use crate::egress::EgressPolicy;
+use crate::types::{is_bounded_did, PushRegistration, WakeTriggerPolicy};
 
 /// Everything the gateway holds for one registered push channel.
 #[derive(Serialize, Deserialize)]
 pub struct HandleRecord {
-    /// The raw platform push token — never leaves the gateway.
+    /// The raw platform push token. Never returned to triggers or the VTA; sent
+    /// only to the platform push service, and written in cleartext to the
+    /// snapshot file when persistence is enabled.
     pub registration: PushRegistration,
     /// The DID of the VTA allowed to provision this handle's allowlist.
     pub controller_vta_did: String,
@@ -62,8 +66,12 @@ impl Store {
     /// existing snapshot if present; a missing file starts empty; an unparseable
     /// file is logged and started empty (rather than refusing to boot — devices
     /// re-register). Subsequent mutations rewrite the snapshot.
-    pub fn open(path: PathBuf) -> Self {
-        let handles = match std::fs::read_to_string(&path) {
+    ///
+    /// Records that fail current registration validation under `policy` (e.g.
+    /// stored before endpoint validation existed) are dropped with a warning;
+    /// the next snapshot write removes them from disk.
+    pub fn open(path: PathBuf, policy: &EgressPolicy) -> Self {
+        let mut handles: HashMap<String, HandleRecord> = match std::fs::read_to_string(&path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
                 tracing::error!(error = %e, path = %path.display(),
                     "gateway store snapshot is unparseable; starting empty");
@@ -71,6 +79,26 @@ impl Store {
             }),
             Err(_) => HashMap::new(), // missing → fresh
         };
+        handles.retain(|_, rec| {
+            let verdict = rec.registration.validate(policy).and_then(|()| {
+                if is_bounded_did(&rec.controller_vta_did) {
+                    Ok(())
+                } else {
+                    Err("controllerVtaDid must be a DID of at most 512 bytes")
+                }
+            });
+            match verdict {
+                Ok(()) => true,
+                Err(reason) => {
+                    tracing::warn!(
+                        platform = rec.registration.platform(),
+                        reason,
+                        "dropping stored handle that fails registration validation"
+                    );
+                    false
+                }
+            }
+        });
         tracing::info!(handles = handles.len(), path = %path.display(),
             "gateway store loaded from snapshot");
         Self {
@@ -169,12 +197,102 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::WebPushKeys;
 
-    fn apns(token: &str) -> PushRegistration {
+    /// A syntactically valid APNs registration: the two-character hex `pair`
+    /// repeated into a 64-character device token.
+    fn apns(pair: &str) -> PushRegistration {
         PushRegistration::Apns {
-            token: token.to_string(),
+            token: pair.repeat(32),
             topic: "org.openvtc.vta.agent".to_string(),
             environment: None,
+        }
+    }
+
+    fn open(path: PathBuf) -> Store {
+        Store::open(path, &EgressPolicy::default())
+    }
+
+    /// Records written before registration validation existed are dropped on
+    /// open; valid records survive.
+    #[test]
+    fn open_drops_records_that_fail_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gateway-store.json");
+        let keys = WebPushKeys {
+            p256dh:
+                "BHTHkS5TN8hSA9_AzgRusH55jqrZjomGJ42mYrmFNIKH1cc0JnR6ZzwjcWQljvhdjlapl3nOtq2P6e9IMjMoWrY"
+                    .into(),
+            auth: "-8GwtL6MnCVPpyjEYoad2A".into(),
+        };
+        {
+            // `insert` does not validate, so it can write legacy-shaped records.
+            let store = open(path.clone());
+            let legacy = [
+                (
+                    "ok-webpush",
+                    PushRegistration::Webpush {
+                        endpoint: "https://fcm.googleapis.com/fcm/send/x".into(),
+                        keys: keys.clone(),
+                    },
+                ),
+                ("ok-apns", apns("ab")),
+                (
+                    "bad-loopback",
+                    PushRegistration::Webpush {
+                        endpoint: "http://127.0.0.1:9099/x".into(),
+                        keys: keys.clone(),
+                    },
+                ),
+                (
+                    "bad-keys",
+                    PushRegistration::Webpush {
+                        endpoint: "https://fcm.googleapis.com/fcm/send/y".into(),
+                        keys: WebPushKeys {
+                            p256dh: "k".into(),
+                            auth: "a".into(),
+                        },
+                    },
+                ),
+                (
+                    "bad-apns-token",
+                    PushRegistration::Apns {
+                        token: "../x".into(),
+                        topic: "org.openvtc.vta.agent".into(),
+                        environment: None,
+                    },
+                ),
+            ];
+            for (h, reg) in legacy {
+                store.insert(h.into(), reg, "did:web:vta.example".into());
+                store.provision(
+                    h,
+                    "did:web:vta.example",
+                    WakeTriggerPolicy {
+                        allowed_triggers: vec!["did:key:zT".into()],
+                    },
+                );
+            }
+        }
+
+        let reopened = open(path);
+        for h in ["ok-webpush", "ok-apns"] {
+            assert!(
+                matches!(
+                    reopened.authorize_wake(h, "did:key:zT"),
+                    WakeAuthz::Allowed(_)
+                ),
+                "{h} should survive reopen"
+            );
+        }
+        for h in ["bad-loopback", "bad-keys", "bad-apns-token"] {
+            assert!(
+                matches!(
+                    reopened.authorize_wake(h, "did:key:zT"),
+                    WakeAuthz::UnknownHandle
+                ),
+                "{h} should be dropped on reopen"
+            );
         }
     }
 
@@ -187,9 +305,9 @@ mod tests {
         let path = dir.path().join("gateway-store.json");
 
         {
-            let store = Store::open(path.clone());
-            store.insert("h1".into(), apns("tok-1"), "did:web:vta.example".into());
-            store.insert("h2".into(), apns("tok-2"), "did:web:vta.example".into());
+            let store = open(path.clone());
+            store.insert("h1".into(), apns("a1"), "did:web:vta.example".into());
+            store.insert("h2".into(), apns("b2"), "did:web:vta.example".into());
             store.provision(
                 "h1",
                 "did:web:vta.example",
@@ -200,10 +318,12 @@ mod tests {
             store.remove("h2");
         } // drop → "restart"
 
-        let reopened = Store::open(path);
+        let reopened = open(path);
         // h1 persisted with its token + provisioned allowlist.
         match reopened.authorize_wake("h1", "did:key:zTrigger") {
-            WakeAuthz::Allowed(PushRegistration::Apns { token, .. }) => assert_eq!(token, "tok-1"),
+            WakeAuthz::Allowed(PushRegistration::Apns { token, .. }) => {
+                assert_eq!(token, "a1".repeat(32))
+            }
             _ => panic!("h1 should be allowed for the provisioned trigger after reopen"),
         }
         // A non-allowlisted trigger is still rejected.
@@ -222,7 +342,7 @@ mod tests {
     #[test]
     fn missing_snapshot_starts_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("does-not-exist.json"));
+        let store = open(dir.path().join("does-not-exist.json"));
         assert!(matches!(
             store.authorize_wake("h1", "did:key:zTrigger"),
             WakeAuthz::UnknownHandle
@@ -233,7 +353,7 @@ mod tests {
     #[test]
     fn in_memory_store_persists_nothing() {
         let store = Store::new();
-        store.insert("h1".into(), apns("tok"), "did:web:vta.example".into());
+        store.insert("h1".into(), apns("c3"), "did:web:vta.example".into());
         store.provision(
             "h1",
             "did:web:vta.example",

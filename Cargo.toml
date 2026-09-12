@@ -11,7 +11,7 @@ rust-version = "1.85"
 # HTTP surface (the REST gateway transport of the push binding). axum/tower
 # mirror the trust-tasks-https binding's server stack.
 axum = "0.8"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "time"] }
 tower-http = { version = "0.6", features = ["trace"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -55,6 +55,9 @@ p256 = { version = "0.13", features = ["ecdsa", "pem", "pkcs8"] }
 # HTTP/1.1, but APNs does not.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 http = "1"
+# Web Push endpoint validation (egress policy). Already in the tree via reqwest;
+# named directly to match on `url::Host`.
+url = "2"
 # FCM HTTP v1 authorises with an OAuth2 access token, obtained by signing a
 # service-account assertion JWT with RS256. We sign with `aws-lc-rs` (already in
 # the tree via rustls) so the vulnerable `rsa` crate (Marvin Attack,
@@ -65,3 +68,5 @@ aws-lc-rs = "1"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
+# Paused-clock tests for the wake send timeout.
+tokio = { version = "1", features = ["test-util"] }

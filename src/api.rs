@@ -15,10 +15,11 @@
 //! it (see the architecture note — no dedicated worker, which would bottleneck).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     body::Bytes,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -31,10 +32,19 @@ use trust_tasks_rs::{RejectReason, TrustTask};
 use uuid::Uuid;
 
 use crate::auth::{self, HEADER_DID, HEADER_SIG};
+use crate::egress::EgressPolicy;
 use crate::metrics::Metrics;
 use crate::sender::{self, PushSender, SendOutcome};
 use crate::store::{ProvisionOutcome, Store, WakeAuthz};
 use crate::types::{ProvisionRequest, RegisterRequest, WakePayload, WakeRequest};
+
+/// Largest accepted `POST /trust-tasks` body. Real `push/*` documents are well
+/// under 2 KiB; larger bodies get `413 Payload Too Large`.
+pub const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024;
+
+/// Upper bound on one push send in the wake path, independent of any
+/// per-sender client timeout.
+pub const WAKE_SEND_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -44,6 +54,8 @@ pub struct AppState {
     pub gateway_addr: String,
     /// Operation counters scraped at `GET /metrics`.
     pub metrics: Arc<Metrics>,
+    /// What registrations may point push delivery at.
+    pub egress: Arc<EgressPolicy>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -51,6 +63,7 @@ pub fn router(state: AppState) -> Router {
         .route("/trust-tasks", post(trust_tasks))
         .route("/healthz", get(|| async { "ok" }))
         .route("/metrics", get(metrics))
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
 
@@ -93,6 +106,16 @@ fn success_value<R: Serialize>(doc: &TrustTask<Value>, payload: R) -> Value {
 /// Serialize a `trust-task-error` document for this request.
 fn reject_value(doc: &TrustTask<Value>, reason: RejectReason) -> Value {
     serde_json::to_value(doc.reject_with(new_id(), reason)).unwrap_or(Value::Null)
+}
+
+/// A `malformed_request` error document with a fixed, caller-safe reason.
+fn malformed(doc: &TrustTask<Value>, reason: &str) -> Value {
+    reject_value(
+        doc,
+        RejectReason::MalformedRequest {
+            reason: reason.to_string(),
+        },
+    )
 }
 
 /// Parse `doc.payload` into the typed body, or return a `malformed_request`
@@ -141,12 +164,17 @@ pub(crate) async fn dispatch_push(
 }
 
 /// `push/register` — unauthenticated by design (the handle is opaque and useless
-/// until its VTA provisions a trigger allowlist).
+/// until its VTA provisions a trigger allowlist). The registration is validated
+/// (field bounds, Web Push endpoint policy, APNs topic policy) before anything
+/// is stored.
 async fn handle_register(state: &AppState, doc: &TrustTask<Value>) -> Value {
     let req: RegisterRequest = match parse(doc) {
         Ok(r) => r,
         Err(v) => return v,
     };
+    if let Err(reason) = req.validate(&state.egress) {
+        return malformed(doc, reason);
+    }
     if sender::select(&state.senders, &req.registration).is_none() {
         return reject_value(
             doc,
@@ -220,6 +248,9 @@ async fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<V
         Ok(r) => r,
         Err(v) => return v,
     };
+    if let Err(reason) = req.validate() {
+        return malformed(doc, reason);
+    }
     let registration = match state.store.authorize_wake(&req.handle, &trigger) {
         WakeAuthz::Allowed(reg) => reg,
         WakeAuthz::UnknownHandle => {
@@ -257,7 +288,19 @@ async fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<V
         count: req.count,
         urgency: req.urgency,
     };
-    match s.send(&registration, &payload).await {
+    // Bound the send even if a sender's own client has no timeout.
+    let outcome =
+        match tokio::time::timeout(WAKE_SEND_TIMEOUT, s.send(&registration, &payload)).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::warn!(
+                    platform = registration.platform(),
+                    "push send exceeded the wake timeout"
+                );
+                SendOutcome::TransientFailure
+            }
+        };
+    match outcome {
         SendOutcome::Delivered => {
             state.metrics.inc_wake_delivered();
             success_value(doc, json!({ "status": "delivered" }))

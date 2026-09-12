@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use axum::Router;
 use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use http_body_util::BodyExt;
@@ -14,6 +15,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use vti_push_gateway::api::{router, AppState};
+use vti_push_gateway::egress::EgressPolicy;
 use vti_push_gateway::sender::{EchoSender, PushSender, SendOutcome};
 use vti_push_gateway::store::Store;
 
@@ -47,7 +49,43 @@ fn state() -> AppState {
         senders: Arc::new(senders),
         gateway_addr: "https://gw.test".into(),
         metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
+        egress: Arc::new(EgressPolicy::default()),
     }
+}
+
+/// A syntactically valid 64-character hex APNs device token.
+fn apns_token() -> String {
+    "a1".repeat(32)
+}
+
+/// A valid Web Push subscription key pair (65-byte P-256 point, 16-byte auth).
+const P256DH: &str =
+    "BHTHkS5TN8hSA9_AzgRusH55jqrZjomGJ42mYrmFNIKH1cc0JnR6ZzwjcWQljvhdjlapl3nOtq2P6e9IMjMoWrY";
+const AUTH: &str = "-8GwtL6MnCVPpyjEYoad2A";
+
+/// Scrape `GET /metrics` through the router.
+async fn metrics_text(app: &Router) -> String {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap()
 }
 
 /// A `TrustTask` document with the given type URI + payload.
@@ -96,7 +134,7 @@ async fn full_flow_register_provision_wake() {
     let reg = tt_doc(
         PUSH_REGISTER,
         json!({
-            "registration": { "platform": "apns", "token": "abc", "topic": "org.openvtc.app" },
+            "registration": { "platform": "apns", "token": apns_token(), "topic": "org.openvtc.app" },
             "controllerVtaDid": did_key_for(&vta),
         }),
     );
@@ -190,7 +228,7 @@ async fn register_v2_returns_v2_response() {
     let reg = tt_doc(
         PUSH_REGISTER,
         json!({
-            "registration": { "platform": "apns", "token": "abc", "topic": "org.openvtc.app" },
+            "registration": { "platform": "apns", "token": apns_token(), "topic": "org.openvtc.app" },
             "controllerVtaDid": did_key_for(&vta),
         }),
     );
@@ -219,7 +257,7 @@ async fn v0_1_uris_are_rejected() {
         tt_doc(
             PUSH_REGISTER_V1,
             json!({
-                "registration": { "platform": "apns", "token": "abc", "topic": "org.openvtc.app" },
+                "registration": { "platform": "apns", "token": apns_token(), "topic": "org.openvtc.app" },
                 "controllerVtaDid": did_key_for(&vta),
             }),
         ),
@@ -270,7 +308,7 @@ async fn dead_token_reports_v2_token_unregistered_status() {
     let reg = tt_doc(
         PUSH_REGISTER,
         json!({
-            "registration": { "platform": "apns", "token": "dead", "topic": "org.openvtc.app" },
+            "registration": { "platform": "apns", "token": "de".repeat(32), "topic": "org.openvtc.app" },
             "controllerVtaDid": did_key_for(&vta),
         }),
     );
@@ -318,7 +356,7 @@ async fn metrics_endpoint_reflects_operations() {
     let reg = tt_doc(
         PUSH_REGISTER,
         json!({
-            "registration": { "platform": "apns", "token": "abc", "topic": "org.openvtc.app" },
+            "registration": { "platform": "apns", "token": apns_token(), "topic": "org.openvtc.app" },
             "controllerVtaDid": did_key_for(&vta),
         }),
     );
@@ -348,26 +386,7 @@ async fn metrics_endpoint_reflects_operations() {
         .unwrap();
 
     // Scrape /metrics.
-    let resp = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/metrics")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let text = String::from_utf8(
-        resp.into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .to_vec(),
-    )
-    .unwrap();
+    let text = metrics_text(&app).await;
 
     assert!(text.contains("gateway_register_total 1\n"), "{text}");
     assert!(
@@ -405,6 +424,132 @@ async fn provision_without_auth_is_rejected() {
     assert!(
         !is_success(&doc),
         "unauthenticated provision must be rejected: {doc}"
+    );
+}
+
+/// The PoC `sub-ssrf.json` payload — an unauthenticated `push/register` whose
+/// Web Push endpoint points at an internal metadata service — is rejected, and
+/// nothing is registered (`gateway_register_total` stays 0).
+#[tokio::test]
+async fn register_ssrf_webpush_endpoint_is_rejected() {
+    let app = router(state());
+    // The exact endpoint from pocs/.../sub-ssrf.json (with the payload's own keys).
+    let reg = tt_doc(
+        PUSH_REGISTER,
+        json!({
+            "registration": {
+                "platform": "webpush",
+                "endpoint": "http://127.0.0.1:9099/latest/meta-data/iam/security-credentials/",
+                "keys": {
+                    "p256dh": P256DH,
+                    "auth": AUTH,
+                }
+            },
+            "controllerVtaDid": did_key_for(&signing_key()),
+        }),
+    );
+    let resp = app.clone().oneshot(post(&reg, None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc = body_json(resp).await;
+    assert!(
+        doc["type"]
+            .as_str()
+            .is_some_and(|t| t.contains("trust-task-error")),
+        "SSRF register must return a trust-task-error: {doc}"
+    );
+    assert!(
+        metrics_text(&app)
+            .await
+            .contains("gateway_register_total 0\n"),
+        "nothing must be registered"
+    );
+}
+
+/// A grab-bag of malformed / disallowed registrations are all rejected without
+/// registering anything: a non-allowlisted host, an IP-literal endpoint, junk
+/// subscription keys, a non-hex APNs token, and a bad controller DID.
+#[tokio::test]
+async fn register_rejects_invalid_fields() {
+    let bad_regs = [
+        json!({ "platform": "webpush", "endpoint": "https://evil.example/x",
+                "keys": { "p256dh": P256DH, "auth": AUTH } }),
+        json!({ "platform": "webpush", "endpoint": "https://169.254.169.254/x",
+                "keys": { "p256dh": P256DH, "auth": AUTH } }),
+        json!({ "platform": "webpush", "endpoint": "https://fcm.googleapis.com/x",
+                "keys": { "p256dh": "k", "auth": "a" } }),
+        json!({ "platform": "apns", "token": "../x", "topic": "org.openvtc.app" }),
+    ];
+    for reg in bad_regs {
+        let app = router(state());
+        let reg_is = reg.clone();
+        let doc = tt_doc(
+            PUSH_REGISTER,
+            json!({ "registration": reg, "controllerVtaDid": did_key_for(&signing_key()) }),
+        );
+        let out = body_json(app.clone().oneshot(post(&doc, None)).await.unwrap()).await;
+        assert!(!is_success(&out), "must be rejected: {reg_is} → {out}");
+        assert!(metrics_text(&app)
+            .await
+            .contains("gateway_register_total 0\n"));
+    }
+
+    // A controllerVtaDid that is not a DID is refused even with a valid endpoint.
+    let app = router(state());
+    let doc = tt_doc(
+        PUSH_REGISTER,
+        json!({
+            "registration": { "platform": "webpush", "endpoint": "https://fcm.googleapis.com/x",
+                              "keys": { "p256dh": P256DH, "auth": AUTH } },
+            "controllerVtaDid": "not-a-did",
+        }),
+    );
+    let out = body_json(app.oneshot(post(&doc, None)).await.unwrap()).await;
+    assert!(
+        !is_success(&out),
+        "bad controller DID must be rejected: {out}"
+    );
+}
+
+/// A valid Web Push registration to an allowlisted host is accepted.
+#[tokio::test]
+async fn register_accepts_valid_webpush() {
+    let senders: Vec<Box<dyn PushSender>> = vec![Box::new(EchoSender)];
+    let mut st = state();
+    st.senders = Arc::new(senders);
+    let app = router(st);
+    let reg = tt_doc(
+        PUSH_REGISTER,
+        json!({
+            "registration": { "platform": "webpush",
+                "endpoint": "https://fcm.googleapis.com/fcm/send/abc",
+                "keys": { "p256dh": P256DH, "auth": AUTH } },
+            "controllerVtaDid": did_key_for(&signing_key()),
+        }),
+    );
+    let doc = body_json(app.oneshot(post(&reg, None)).await.unwrap()).await;
+    assert!(
+        is_success(&doc),
+        "valid webpush register should succeed: {doc}"
+    );
+}
+
+/// The 16 KiB body limit rejects an oversized `POST /trust-tasks`.
+#[tokio::test]
+async fn oversized_body_is_rejected() {
+    let app = router(state());
+    let big = "a".repeat(17 * 1024);
+    let reg = tt_doc(
+        PUSH_REGISTER,
+        json!({
+            "registration": { "platform": "fcm", "token": big },
+            "controllerVtaDid": did_key_for(&signing_key()),
+        }),
+    );
+    let status = app.oneshot(post(&reg, None)).await.unwrap().status();
+    assert_eq!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "17 KiB body must be 413"
     );
 }
 

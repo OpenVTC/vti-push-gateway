@@ -5,6 +5,7 @@
 pub mod api;
 pub mod auth;
 pub mod didcomm;
+pub mod egress;
 pub mod identity;
 pub mod metrics;
 pub mod resolver;

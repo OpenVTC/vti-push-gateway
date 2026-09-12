@@ -8,8 +8,10 @@ role in the wake-up model (gateway / trigger / device):
   account, Web Push VAPID key) — the only party that can deliver a push to the
   app. Operated by the app publisher (the [Matrix Sygnal](https://github.com/matrix-org/sygnal)
   role).
-- Issues an **opaque `WakeHandle`** for a registered device token. The raw token
-  never leaves the gateway.
+- Issues an **opaque `WakeHandle`** for a registered device token. Triggers and
+  the VTA only ever see the handle — the raw platform token is never returned to
+  them; it is sent only to the platform push service (and, when persistence is
+  enabled, written to the gateway's own store file — see the Security notes).
 - Enforces a **VTA-provisioned trigger allowlist** per handle.
 - Relays a strictly **contentless** wake — never any Trust Task content.
 
@@ -128,6 +130,18 @@ cargo run
 #                       account (Firebase) → enables the FCM sender
 # GATEWAY_STORE_FILE=./gateway-store.json   persist the handle registry to this
 #                       JSON snapshot (survives restart). Omit = in-memory.
+# Egress / endpoint policy (all optional):
+# GATEWAY_WEBPUSH_ALLOWED_HOSTS=@default,push.example.org,*.up.example.net
+#                       Web Push services a registration may target. Unset = the
+#                       built-in browser push hosts (fcm.googleapis.com,
+#                       updates.push.services.mozilla.com, web.push.apple.com,
+#                       *.notify.windows.com). `@default` expands to them; add
+#                       exact hosts or `*.suffix` wildcards for self-hosted push
+#                       (autopush / UnifiedPush). Wildcards at a registrable
+#                       domain (e.g. *.googleapis.com) are refused at startup.
+# GATEWAY_APNS_TOPICS=org.openvtc.app,org.openvtc.app.voip
+#                       APNs topics (bundle ids) registrations may name. Unset =
+#                       not enforced (a startup warning is logged).
 # DID resolver tuning (DIDComm path; all optional — defaults suit did:webvh):
 # GATEWAY_DID_CACHE_CAPACITY=250        max cached DID docs
 # GATEWAY_DID_CACHE_TTL_SECS=900        cache entry TTL (SDK default 300)
@@ -247,3 +261,18 @@ Trust Task is pulled from the mediator.
   only ever sees a `WakePayload`).
 - Possession of a handle is not authority to wake — the VTA-provisioned allowlist
   is the control, enforced on every `wake`.
+- **Outbound egress is constrained.** A Web Push endpoint is validated at
+  registration and again before every send: https only, default port, no
+  userinfo, no IP-literal host, bounded length, and the host must be on the
+  `GATEWAY_WEBPUSH_ALLOWED_HOSTS` allow-list. The push HTTP client follows no
+  redirects, ignores system/environment proxies, is https-only, resolves names
+  through a guard that refuses private / loopback / link-local (cloud-metadata)
+  addresses, and has connect/total timeouts. APNs device tokens must be hex and
+  are re-checked before being placed in the request path. This closes the
+  register-driven SSRF and redirect/timeout exposure (SEC-4045 PG-1 / PG-5 /
+  PG-N2).
+- **Persisted tokens are cleartext.** When `GATEWAY_STORE_FILE` is set the raw
+  tokens/subscriptions are written to that JSON file in cleartext; protect it
+  with filesystem permissions. At-rest hardening is tracked separately.
+- `POST /trust-tasks` bodies are capped at 16 KiB, and each registration field
+  is bounded. Rate limiting and per-handle caps are tracked separately.

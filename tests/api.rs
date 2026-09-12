@@ -16,8 +16,9 @@ use tower::ServiceExt;
 
 use vti_push_gateway::api::{metrics_router, router, AppState};
 use vti_push_gateway::egress::EgressPolicy;
+use vti_push_gateway::limits::{Limits, RateConfig, DEFAULT_HTTP, DEFAULT_PER_DID};
 use vti_push_gateway::sender::{EchoSender, PushSender, SendOutcome};
-use vti_push_gateway::store::Store;
+use vti_push_gateway::store::{Store, StoreLimits};
 
 const ED25519_MULTICODEC: [u8; 2] = [0xed, 0x01];
 const PUSH_REGISTER: &str = "https://trusttasks.org/spec/push/register/0.2";
@@ -43,14 +44,28 @@ fn did_key_for(sk: &SigningKey) -> String {
 }
 
 fn state() -> AppState {
+    // Permissive limits by default: these tests exercise the push/* logic, and a
+    // rate limit tripping mid-test would be a confusing failure. The tests that
+    // are *about* the limits set their own.
+    state_with(Store::new(), Limits::permissive())
+}
+
+fn state_with(store: Store, limits: Limits) -> AppState {
     let senders: Vec<Box<dyn PushSender>> = vec![Box::new(EchoSender)];
     AppState {
-        store: Arc::new(Store::new()),
+        store: Arc::new(store),
         senders: Arc::new(senders),
         gateway_addr: "https://gw.test".into(),
         metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
         egress: Arc::new(EgressPolicy::default()),
+        limits: Arc::new(limits),
     }
+}
+
+/// A distinct, valid APNs registration per index — so a flood is not stopped by
+/// the per-token cap when the per-request budget is what's under test.
+fn apns_registration(n: usize) -> Value {
+    json!({ "platform": "apns", "token": format!("{n:064x}"), "topic": "org.openvtc.app" })
 }
 
 /// The public router plus a management router sharing one `AppState`, so a test
@@ -777,4 +792,219 @@ async fn bad_signature_is_401() {
         app.oneshot(req).await.unwrap().status(),
         StatusCode::UNAUTHORIZED
     );
+}
+
+/// A register budget loose enough not to interfere with tests about other
+/// limits.
+const DEFAULT_REGISTER_FOR_TEST: RateConfig = RateConfig {
+    per_second: 1_000_000,
+    burst: 1_000_000,
+};
+
+/// PG-2, the `register-flood.sh` PoC as a test: 200 anonymous registrations from
+/// one caller are accepted only up to the burst, and the register counter stops
+/// climbing. The counter is the assertion that matters — it proves the refusals
+/// happened before anything was stored, not merely that a reply said "no".
+#[tokio::test]
+async fn register_flood_is_refused_after_the_burst() {
+    let burst = 5;
+    // The counters live on the management router now, so both are built over one
+    // shared `AppState` — the public one takes the flood, the management one is
+    // scraped for what it did.
+    let st = state_with(
+        Store::new(),
+        Limits::new(
+            RateConfig {
+                per_second: 1,
+                burst,
+            },
+            DEFAULT_PER_DID,
+            DEFAULT_HTTP,
+        ),
+    );
+    let app = router(st.clone());
+    let metrics_app = metrics_router(st, None);
+
+    let mut accepted = 0;
+    for i in 0..200 {
+        let reg = tt_doc(
+            PUSH_REGISTER,
+            json!({
+                "registration": apns_registration(i),
+                "controllerVtaDid": did_key_for(&signing_key()),
+            }),
+        );
+        let out = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await;
+        if is_success(&out) {
+            accepted += 1;
+        }
+    }
+
+    assert_eq!(
+        accepted, burst as usize,
+        "only the burst may be accepted out of 200"
+    );
+    let text = metrics_text(&metrics_app).await;
+    assert!(
+        text.contains(&format!("gateway_register_total {burst}\n")),
+        "the register counter must stop climbing at the burst: {text}"
+    );
+}
+
+/// The per-DID budget throttles one noisy trigger without touching another —
+/// the reason the wake/provision limiter is keyed rather than global.
+#[tokio::test]
+async fn wake_budget_is_per_caller_did() {
+    let vta = signing_key();
+    let noisy = signing_key();
+    let quiet = signing_key();
+    let app = router(state_with(
+        Store::new(),
+        Limits::new(
+            DEFAULT_REGISTER_FOR_TEST,
+            RateConfig {
+                per_second: 1,
+                burst: 3,
+            },
+            DEFAULT_HTTP,
+        ),
+    ));
+
+    // Register and provision both triggers onto one handle.
+    let reg = tt_doc(
+        PUSH_REGISTER,
+        json!({
+            "registration": apns_registration(1),
+            "controllerVtaDid": did_key_for(&vta),
+        }),
+    );
+    let handle = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await["payload"]
+        ["wakeHandle"]["handle"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let prov = tt_doc(
+        PUSH_PROVISION,
+        json!({ "handle": handle, "policy": { "allowedTriggers":
+                [did_key_for(&noisy), did_key_for(&quiet)] } }),
+    );
+    assert!(is_success(
+        &body_json(app.clone().oneshot(post(&prov, Some(&vta))).await.unwrap()).await
+    ));
+
+    // The noisy trigger burns its own bucket (provision above already spent one
+    // of the VTA's, not the triggers').
+    let wake = tt_doc(PUSH_WAKE, json!({ "handle": handle, "v": 1 }));
+    let mut noisy_ok = 0;
+    for _ in 0..10 {
+        let out = body_json(
+            app.clone()
+                .oneshot(post(&wake, Some(&noisy)))
+                .await
+                .unwrap(),
+        )
+        .await;
+        if is_success(&out) {
+            noisy_ok += 1;
+        }
+    }
+    assert_eq!(noisy_ok, 3, "the noisy trigger is capped at its burst");
+
+    // The quiet trigger is unaffected.
+    let out = body_json(
+        app.clone()
+            .oneshot(post(&wake, Some(&quiet)))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        is_success(&out),
+        "a different trigger DID must not be throttled: {out}"
+    );
+}
+
+/// With `max_handles = 10`, the 11th registration is refused and nothing is
+/// stored for it.
+#[tokio::test]
+async fn eleventh_registration_is_refused_at_capacity() {
+    let st = state_with(
+        Store::with_limits(StoreLimits {
+            max_handles: 10,
+            ..StoreLimits::default()
+        }),
+        Limits::permissive(),
+    );
+    let app = router(st.clone());
+    let metrics_app = metrics_router(st, None);
+
+    for i in 0..10 {
+        let reg = tt_doc(
+            PUSH_REGISTER,
+            json!({
+                "registration": apns_registration(i),
+                "controllerVtaDid": did_key_for(&signing_key()),
+            }),
+        );
+        let out = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await;
+        assert!(
+            is_success(&out),
+            "registration {i} is within the cap: {out}"
+        );
+    }
+
+    let reg = tt_doc(
+        PUSH_REGISTER,
+        json!({
+            "registration": apns_registration(10),
+            "controllerVtaDid": did_key_for(&signing_key()),
+        }),
+    );
+    let out = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await;
+    assert!(!is_success(&out), "the 11th must be refused: {out}");
+    assert!(
+        out.to_string().contains("gateway at capacity"),
+        "the reason should name the limit: {out}"
+    );
+    let text = metrics_text(&metrics_app).await;
+    assert!(
+        text.contains("gateway_register_total 10\n"),
+        "the refused registration must not be counted: {text}"
+    );
+}
+
+/// The per-token cap stops one push token from occupying the registry, even
+/// though each request is otherwise valid.
+#[tokio::test]
+async fn repeated_registration_of_one_token_is_capped() {
+    let app = router(state_with(
+        Store::with_limits(StoreLimits {
+            max_per_token: 2,
+            ..StoreLimits::default()
+        }),
+        Limits::permissive(),
+    ));
+
+    let mut accepted = 0;
+    for _ in 0..6 {
+        // The same device token every time.
+        let reg = tt_doc(
+            PUSH_REGISTER,
+            json!({
+                "registration": apns_registration(7),
+                "controllerVtaDid": did_key_for(&signing_key()),
+            }),
+        );
+        let out = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await;
+        if is_success(&out) {
+            accepted += 1;
+        } else {
+            assert!(
+                out.to_string()
+                    .contains("too many handles for this push token"),
+                "{out}"
+            );
+        }
+    }
+    assert_eq!(accepted, 2, "one token gets max_per_token handles, no more");
 }

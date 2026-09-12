@@ -63,6 +63,16 @@ url = "2"
 # the tree via rustls) so the vulnerable `rsa` crate (Marvin Attack,
 # RUSTSEC-2023-0071) never enters — same "no rsa" stance as VAPID/APNs above.
 aws-lc-rs = "1"
+# Rate limiting in two layers. `governor` (GCRA) is the limiter itself, used
+# directly inside the transport-agnostic dispatch core so that DIDComm — which
+# never passes through axum middleware — is covered too. `tower_governor` is the
+# HTTP-middleware wrapper around it, keyed by peer IP on the public router; it
+# already targets axum 0.8.
+governor = "0.10"
+# `default-features = false` matters: the default feature set enables `tonic`,
+# which drags a gRPC stack (and its own HTTP/2 and prost trees) into a crate that
+# speaks neither. Only the axum integration is wanted.
+tower_governor = { version = "0.8", default-features = false, features = ["axum"] }
 # The store snapshot holds raw push tokens, so it is written through a private
 # temp file: `NamedTempFile::new_in` gives an O_EXCL, mode-0600, unpredictably
 # named file in the target directory, which a `with_extension("json.tmp")` path

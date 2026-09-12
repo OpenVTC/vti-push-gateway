@@ -37,6 +37,7 @@ use uuid::Uuid;
 
 use crate::auth::{self, HEADER_DID, HEADER_SIG};
 use crate::egress::EgressPolicy;
+use crate::limits::Limits;
 use crate::metrics::Metrics;
 use crate::sender::{self, PushSender, SendOutcome};
 use crate::store::{ProvisionOutcome, Store, WakeAuthz};
@@ -75,6 +76,9 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     /// What registrations may point push delivery at.
     pub egress: Arc<EgressPolicy>,
+    /// Per-operation rate limits. Consulted in [`dispatch_push`] rather than in
+    /// HTTP middleware, so the DIDComm transport is covered too.
+    pub limits: Arc<Limits>,
 }
 
 /// The **public** router: the `push/*` Trust-Task endpoint and a liveness probe.
@@ -181,6 +185,23 @@ fn reject_value(doc: &TrustTask<Value>, reason: RejectReason) -> Value {
     serde_json::to_value(doc.reject_with(new_id(), reason)).unwrap_or(Value::Null)
 }
 
+/// A `trust-task-error` for a caller that has exceeded its budget.
+///
+/// `TaskFailed` rather than a transport status because the dispatch core is
+/// transport-agnostic: a DIDComm caller has no HTTP status to receive, and the
+/// in-band envelope is the contract both transports share. The HTTP layer
+/// separately answers 429 for requests it sheds before parsing.
+fn rate_limited(doc: &TrustTask<Value>, operation: &str) -> Value {
+    tracing::warn!(operation, "rate limit exceeded; refusing the request");
+    reject_value(
+        doc,
+        RejectReason::TaskFailed {
+            reason: "rate limit exceeded; retry later".into(),
+            details: None,
+        },
+    )
+}
+
 /// A `malformed_request` error document with a fixed, caller-safe reason.
 fn malformed(doc: &TrustTask<Value>, reason: &str) -> Value {
     reject_value(
@@ -220,9 +241,34 @@ pub(crate) async fn dispatch_push(
         // field-identical; `push/wake`'s response `status` enum became
         // `tokenUnregistered`. `respond_with` mirrors the request version
         // into the `#response`.
-        ("push/register", 0, 2) => handle_register(state, doc).await,
-        ("push/provision", 0, 2) => handle_provision(state, sender, doc).await,
-        ("push/wake", 0, 2) => handle_wake(state, sender, doc).await,
+        //
+        // Rate limits are applied here, before any handler work. `register` is
+        // anonymous so it draws on one global budget; `provision`/`wake` are
+        // authenticated so they are keyed by the caller DID. An unauthenticated
+        // provision/wake is not charged to anyone — it is refused by the handler
+        // for lack of proof, which costs nothing.
+        ("push/register", 0, 2) => {
+            if !state.limits.allow_register() {
+                return rate_limited(doc, "push/register");
+            }
+            handle_register(state, doc).await
+        }
+        ("push/provision", 0, 2) => {
+            if let Some(caller) = sender.as_deref() {
+                if !state.limits.allow_did(caller) {
+                    return rate_limited(doc, "push/provision");
+                }
+            }
+            handle_provision(state, sender, doc).await
+        }
+        ("push/wake", 0, 2) => {
+            if let Some(caller) = sender.as_deref() {
+                if !state.limits.allow_did(caller) {
+                    return rate_limited(doc, "push/wake");
+                }
+            }
+            handle_wake(state, sender, doc).await
+        }
         _ => reject_value(
             doc,
             RejectReason::UnsupportedType {
@@ -254,9 +300,21 @@ async fn handle_register(state: &AppState, doc: &TrustTask<Value>) -> Value {
         );
     }
     let handle = new_handle();
-    state
+    // The store enforces the registry caps; a refusal is reported in-band with a
+    // reason that names the limit but nothing about other tenants.
+    if let Err(e) = state
         .store
-        .insert(handle.clone(), req.registration, req.controller_vta_did);
+        .insert(handle.clone(), req.registration, req.controller_vta_did)
+    {
+        tracing::warn!(reason = e.reason(), "refusing registration");
+        return reject_value(
+            doc,
+            RejectReason::TaskFailed {
+                reason: e.reason().into(),
+                details: None,
+            },
+        );
+    }
     state.metrics.inc_register();
     success_value(
         doc,

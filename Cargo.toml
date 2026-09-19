@@ -28,15 +28,15 @@ rand = "0.10"
 # Canonical Trust Task envelope + the push/* payload types (the gateway's
 # control plane is the push/* Trust Task family). The gateway dispatches
 # push/register|provision|wake documents over HTTPS (and, next, DIDComm).
-trust-tasks-rs = { version = "0.19.4", default-features = false }
+trust-tasks-rs = { version = "0.21.3", default-features = false }
 # Response document ids (urn:uuid).
 uuid = { version = "1", features = ["v4"] }
 # DIDComm server transport (the preferred transport). Mirrors vta-service:
 # DIDCommService + Router host that does server-side unpack + sender-auth; the
 # gateway provides its provisioned did:webvh identity secrets + a Router of
 # push/* handlers that call the shared dispatch_push core.
-affinidi-messaging-didcomm-service = "0.7"
-affinidi-tdk = "0.13"
+affinidi-messaging-didcomm-service = "0.11"
+affinidi-tdk = "0.16"
 affinidi-secrets-resolver = "0.5"
 # 0.8.37 is a floor, not cosmetic: it is the first release whose did:web **and**
 # did:webvh resolvers refuse non-public hosts by default (didwebvh-rs 0.7's
@@ -44,7 +44,7 @@ affinidi-secrets-resolver = "0.5"
 # DIDComm transport resolves DIDs chosen by whoever sends the gateway a message,
 # so resolving below this floor would reintroduce a resolver-side SSRF. Pinning
 # the patch stops a fresh `cargo update` from resolving back under it.
-affinidi-did-resolver-cache-sdk = { version = "0.8.37", features = ["network"] }
+affinidi-did-resolver-cache-sdk = { version = "0.8.38", features = ["network"] }
 tokio-util = "0.7"
 # Async push senders (real delivery — Web Push / APNs — is async HTTP).
 async-trait = "0.1"

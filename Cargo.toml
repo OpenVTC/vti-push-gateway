@@ -28,15 +28,15 @@ rand = "0.10"
 # Canonical Trust Task envelope + the push/* payload types (the gateway's
 # control plane is the push/* Trust Task family). The gateway dispatches
 # push/register|provision|wake documents over HTTPS (and, next, DIDComm).
-trust-tasks-rs = { version = "0.21.3", default-features = false }
+trust-tasks-rs = { version = "0.22.7", default-features = false }
 # Response document ids (urn:uuid).
 uuid = { version = "1", features = ["v4"] }
 # DIDComm server transport (the preferred transport). Mirrors vta-service:
 # DIDCommService + Router host that does server-side unpack + sender-auth; the
 # gateway provides its provisioned did:webvh identity secrets + a Router of
 # push/* handlers that call the shared dispatch_push core.
-affinidi-messaging-didcomm-service = "0.11"
-affinidi-tdk = "0.16"
+affinidi-messaging-didcomm-service = "0.12.1"
+affinidi-tdk = "0.17"
 affinidi-secrets-resolver = "0.5"
 # 0.8.37 is a floor, not cosmetic: it is the first release whose did:web **and**
 # did:webvh resolvers refuse non-public hosts by default (didwebvh-rs 0.7's

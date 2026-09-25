@@ -461,6 +461,17 @@ impl Store {
         outcome
     }
 
+    /// Whether `caller_did` is `handle`'s controller VTA — the authorisation
+    /// half of [`Self::provision`], without applying anything. `Ok` when it is.
+    pub fn check_controller(&self, handle: &str, caller_did: &str) -> ProvisionOutcome {
+        let state = self.state.read().unwrap();
+        match state.handles.get(handle) {
+            None => ProvisionOutcome::UnknownHandle,
+            Some(rec) if rec.controller_vta_did != caller_did => ProvisionOutcome::NotController,
+            Some(_) => ProvisionOutcome::Ok,
+        }
+    }
+
     /// Resolve a wake: the trigger DID must be on the handle's allowlist.
     pub fn authorize_wake(&self, handle: &str, trigger_did: &str) -> WakeAuthz {
         let state = self.state.read().unwrap();

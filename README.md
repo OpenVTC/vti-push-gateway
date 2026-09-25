@@ -123,11 +123,15 @@ caller is the document's `issuer`, and only when:
 An `authentication` proof carries no challenge, so the document binds it to one
 delivery (VTI-KEY-107): it must name this gateway as `recipient`, carry an
 `issuedAt` no more than 5 minutes old and no more than 60 s in the future
-(VTI-OPS-024; `expired` / `malformedRequest` otherwise), and an `id` not already
-accepted within that window (VTI-OPS-026). A second delivery of an accepted
-document is answered with the first response and not executed again; a
-different document under an accepted `id` gets `idConflict`. The record is in
-memory and per process.
+(VTI-OPS-024; `expired` / `malformedRequest` otherwise) and not be past its
+`expiresAt`, and carry an `id` the same issuer has not already had accepted
+within that window (VTI-OPS-026). The record is keyed by (issuer, id), bounded
+per issuer, and claimed only after the caller has been rate-limited and
+authorised for the handle, so a refused caller leaves nothing in it. A second
+delivery of an accepted document is answered with the first response and not
+executed again; a different document under the same issuer's accepted `id`
+gets `idConflict`; a transient push failure is not remembered, so a retry is
+attempted. The record is in memory and per process.
 
 `push/provision` then requires that issuer to be the handle's
 `controllerVtaDid`; `push/wake` requires it to be on the allowlist. The DIDComm

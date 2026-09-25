@@ -75,7 +75,7 @@ async fn didcomm_state() -> DidcommState {
         metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
         egress: Arc::new(EgressPolicy::default()),
         limits: Arc::new(Limits::permissive()),
-        replay: Arc::new(trust_tasks_rs::InMemoryReplayGuard::default()),
+        replay: Arc::new(vti_push_gateway::replay::ReplayRecord::default()),
     };
     let client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
         .await
@@ -383,4 +383,236 @@ async fn reused_identifier_is_refused() {
     second["id"] = id;
     let resp = send(&st, Some(&vta.did), &vta.sign(second).await).await;
     assert_eq!(error_code(&resp), "idConflict", "{resp}");
+}
+
+// ── Regression: the replay record and the time bounds ───────────────────
+
+fn with_senders(st: DidcommState, senders: Vec<Box<dyn PushSender>>) -> DidcommState {
+    let mut app = st.app.clone();
+    app.senders = Arc::new(senders);
+    DidcommState { app, ..st }
+}
+
+fn with_record(st: DidcommState, record: vti_push_gateway::replay::ReplayRecord) -> DidcommState {
+    let mut app = st.app.clone();
+    app.replay = Arc::new(record);
+    DidcommState { app, ..st }
+}
+
+fn delivered(st: &DidcommState) -> String {
+    st.app
+        .metrics
+        .render()
+        .lines()
+        .filter(|l| l.contains("delivered"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A handle whose allowlist holds `triggers`, provisioned by `vta`.
+async fn provisioned(st: &DidcommState, vta: &Party, triggers: &[&str]) -> String {
+    let handle = register(st, &vta.did).await;
+    let prov = doc(
+        PUSH_PROVISION,
+        Some(&vta.did),
+        json!({ "handle": handle, "policy": { "allowedTriggers": triggers } }),
+    );
+    let resp = send(st, Some(&vta.did), &vta.sign(prov).await).await;
+    assert!(is_success(&resp), "{resp}");
+    handle
+}
+
+/// A document whose `expiresAt` has already passed is refused — on every
+/// delivery — even though its `issuedAt` is inside the window.
+#[tokio::test]
+async fn an_already_expired_document_is_refused() {
+    let st = didcomm_state().await;
+    let vta = Party::new();
+    let trigger = Party::new();
+    let handle = provisioned(&st, &vta, &[&trigger.did]).await;
+    let before = delivered(&st);
+    let now = chrono::Utc::now();
+    let mut w = wake_doc(&trigger.did, &handle);
+    w["issuedAt"] = json!((now - chrono::TimeDelta::seconds(30)).to_rfc3339());
+    w["expiresAt"] = json!((now - chrono::TimeDelta::seconds(20)).to_rfc3339());
+    let w = trigger.sign(w).await;
+    for _ in 0..3 {
+        let resp = send(&st, None, &w).await;
+        assert_eq!(error_code(&resp), "expired", "{resp}");
+    }
+    assert_eq!(delivered(&st), before, "nothing was sent");
+    assert_eq!(
+        st.app.replay.len_for(&trigger.did),
+        0,
+        "and nothing was recorded"
+    );
+}
+
+/// An unauthorised issuer reusing a victim's document id leaves no record, so
+/// the victim's genuine document is accepted.
+#[tokio::test]
+async fn an_unauthorised_issuer_cannot_squat_an_identifier() {
+    let st = didcomm_state().await;
+    let vta = Party::new();
+    let trigger = Party::new();
+    let attacker = Party::new();
+    let handle = provisioned(&st, &vta, &[&trigger.did]).await;
+
+    let victim = wake_doc(&trigger.did, &handle);
+    let mut squat = wake_doc(&attacker.did, &handle);
+    squat["id"] = victim["id"].clone();
+    let resp = send(&st, None, &attacker.sign(squat).await).await;
+    assert_eq!(error_code(&resp), "permissionDenied", "{resp}");
+    assert_eq!(
+        st.app.replay.len_for(&attacker.did),
+        0,
+        "a refused caller leaves no record"
+    );
+
+    let resp = send(&st, Some(&trigger.did), &trigger.sign(victim).await).await;
+    assert!(
+        is_success(&resp),
+        "the victim's document is unaffected: {resp}"
+    );
+}
+
+/// A flood of self-signed documents from an unauthorised did:key claims
+/// nothing, so it cannot evict a legitimate record and make it replayable.
+#[tokio::test]
+async fn an_unauthorised_flood_cannot_evict_a_record() {
+    let st = with_record(
+        didcomm_state().await,
+        vti_push_gateway::replay::ReplayRecord::new(50, 50),
+    );
+    let vta = Party::new();
+    let trigger = Party::new();
+    let attacker = Party::new();
+    let handle = provisioned(&st, &vta, &[&trigger.did]).await;
+    let legit = trigger.sign(wake_doc(&trigger.did, &handle)).await;
+    let first = send(&st, None, &legit).await;
+    assert!(is_success(&first), "{first}");
+    for _ in 0..60 {
+        send(
+            &st,
+            None,
+            &attacker.sign(wake_doc(&attacker.did, &handle)).await,
+        )
+        .await;
+    }
+    let sent = delivered(&st);
+    let again = send(&st, None, &legit).await;
+    assert_eq!(again, first, "still recognised as a duplicate");
+    assert_eq!(delivered(&st), sent, "and not sent again");
+}
+
+/// One authorised issuer filling its own partition cannot evict another's
+/// records; at its bound it is refused rather than evicting its own.
+#[tokio::test]
+async fn one_issuer_cannot_evict_anothers_records() {
+    let st = with_record(
+        didcomm_state().await,
+        vti_push_gateway::replay::ReplayRecord::new(5, 1_000),
+    );
+    let vta = Party::new();
+    let a = Party::new();
+    let b = Party::new();
+    let handle = provisioned(&st, &vta, &[&a.did, &b.did]).await;
+    let b_wake = b.sign(wake_doc(&b.did, &handle)).await;
+    let b_first = send(&st, None, &b_wake).await;
+    assert!(is_success(&b_first));
+    for i in 0..6 {
+        let resp = send(&st, None, &a.sign(wake_doc(&a.did, &handle)).await).await;
+        assert_eq!(is_success(&resp), i < 5, "#{i}: {resp}");
+    }
+    assert_eq!(
+        st.app.replay.len_for(&a.did),
+        5,
+        "a's own records were kept"
+    );
+    let sent = delivered(&st);
+    assert_eq!(
+        send(&st, None, &b_wake).await,
+        b_first,
+        "b's record survives"
+    );
+    assert_eq!(delivered(&st), sent);
+}
+
+/// The same id from two different issuers are two documents.
+#[tokio::test]
+async fn the_record_is_keyed_by_issuer_and_id() {
+    let st = didcomm_state().await;
+    let vta = Party::new();
+    let a = Party::new();
+    let b = Party::new();
+    let handle = provisioned(&st, &vta, &[&a.did, &b.did]).await;
+    let a_wake = wake_doc(&a.did, &handle);
+    let mut b_wake = wake_doc(&b.did, &handle);
+    b_wake["id"] = a_wake["id"].clone();
+    assert!(is_success(&send(&st, None, &a.sign(a_wake).await).await));
+    let resp = send(&st, None, &b.sign(b_wake).await).await;
+    assert!(is_success(&resp), "not an idConflict: {resp}");
+}
+
+struct FlakySender(std::sync::atomic::AtomicUsize);
+
+#[async_trait::async_trait]
+impl PushSender for FlakySender {
+    fn handles(&self, _: &vti_push_gateway::types::PushRegistration) -> bool {
+        true
+    }
+    async fn send(
+        &self,
+        _: &vti_push_gateway::types::PushRegistration,
+        _: &vti_push_gateway::types::WakePayload,
+    ) -> vti_push_gateway::sender::SendOutcome {
+        // Fails the first attempt, delivers after that.
+        if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            vti_push_gateway::sender::SendOutcome::TransientFailure
+        } else {
+            vti_push_gateway::sender::SendOutcome::Delivered
+        }
+    }
+}
+
+/// A transient push failure is not cached: a retry of the same document is
+/// attempted again, and then its success is what a duplicate gets.
+#[tokio::test]
+async fn a_transient_failure_is_retried_not_cached() {
+    let st = with_senders(
+        didcomm_state().await,
+        vec![Box::new(FlakySender(std::sync::atomic::AtomicUsize::new(
+            0,
+        )))],
+    );
+    let vta = Party::new();
+    let trigger = Party::new();
+    let handle = provisioned(&st, &vta, &[&trigger.did]).await;
+    let w = trigger.sign(wake_doc(&trigger.did, &handle)).await;
+    let first = send(&st, None, &w).await;
+    assert_eq!(error_code(&first), "taskFailed", "{first}");
+    let retry = send(&st, None, &w).await;
+    assert!(is_success(&retry), "the retry is attempted: {retry}");
+    assert_eq!(
+        send(&st, None, &w).await,
+        retry,
+        "now a duplicate of the success"
+    );
+}
+
+/// A refused provision (wrong controller) leaves no record either.
+#[tokio::test]
+async fn a_refused_provision_leaves_no_record() {
+    let st = didcomm_state().await;
+    let vta = Party::new();
+    let other = Party::new();
+    let handle = register(&st, &vta.did).await;
+    let prov = other
+        .sign(provision_doc(&other.did, &handle, &other.did))
+        .await;
+    assert_eq!(
+        error_code(&send(&st, None, &prov).await),
+        "permissionDenied"
+    );
+    assert_eq!(st.app.replay.len_for(&other.did), 0);
 }

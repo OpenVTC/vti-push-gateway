@@ -155,8 +155,29 @@ impl ProofVerifier {
         })?;
         let doc = serde_json::to_value(&resolved.doc)
             .map_err(|_| invalid("issuer DID document did not serialise"))?;
-        authentication_key_in(&doc, issuer, vm)
+        check_document_size(&doc)?;
+        authentication_key_in(&doc, issuer, vm, chrono::Utc::now())
     }
+}
+
+/// Largest issuer DID document the verifier will walk. A `push/*` caller's
+/// document names a handful of keys and services; anything this size is not
+/// one, and walking it costs the gateway for a document the sender chose.
+pub const MAX_DID_DOCUMENT_BYTES: usize = 64 * 1024;
+
+/// Refuse a resolved DID document larger than [`MAX_DID_DOCUMENT_BYTES`].
+///
+/// This bounds what verification processes after resolution. The download
+/// itself is bounded by the resolver's network timeout; the resolver exposes
+/// no response-size limit of its own.
+pub(crate) fn check_document_size(doc: &Value) -> Result<(), ProofError> {
+    let size = serde_json::to_vec(doc)
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
+    if size > MAX_DID_DOCUMENT_BYTES {
+        return Err(invalid("issuer DID document is too large"));
+    }
+    Ok(())
 }
 
 /// Step 4 over an already-resolved DID document (split out for testing).
@@ -164,6 +185,7 @@ pub(crate) fn authentication_key_in(
     doc: &Value,
     issuer: &str,
     vm: &str,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ResolvedKey, ProofError> {
     if doc.get("id").and_then(Value::as_str) != Some(issuer) {
         return Err(invalid("resolved DID document is not the issuer's"));
@@ -193,6 +215,22 @@ pub(crate) fn authentication_key_in(
         return Err(invalid(
             "the proof's verificationMethod is not controlled by the issuer",
         ));
+    }
+
+    // A revoked method signs nothing, whenever it was revoked; an expired one
+    // signs nothing once `expires` has passed. A value that does not parse is
+    // treated as the restrictive reading.
+    if method.get("revoked").is_some_and(|v| !v.is_null()) {
+        return Err(invalid("the proof's verificationMethod is revoked"));
+    }
+    if let Some(expires) = method.get("expires").filter(|v| !v.is_null()) {
+        let still_valid = expires
+            .as_str()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .is_some_and(|t| t > now);
+        if !still_valid {
+            return Err(invalid("the proof's verificationMethod has expired"));
+        }
     }
 
     let is_listed = doc
@@ -269,17 +307,21 @@ mod tests {
     #[test]
     fn accepts_an_authentication_method_controlled_by_the_issuer() {
         let d = doc(vm(DID), json!([format!("{DID}#key-0")]));
-        assert!(authentication_key_in(&d, DID, &format!("{DID}#key-0")).is_ok());
+        assert!(
+            authentication_key_in(&d, DID, &format!("{DID}#key-0"), chrono::Utc::now()).is_ok()
+        );
         // Relative references resolve against the issuer.
         let d = doc(vm(DID), json!(["#key-0"]));
-        assert!(authentication_key_in(&d, DID, &format!("{DID}#key-0")).is_ok());
+        assert!(
+            authentication_key_in(&d, DID, &format!("{DID}#key-0"), chrono::Utc::now()).is_ok()
+        );
     }
 
     #[test]
     fn refuses_a_method_controlled_by_someone_else() {
         let d = doc(vm("did:key:zOther"), json!([format!("{DID}#key-0")]));
         assert!(matches!(
-            authentication_key_in(&d, DID, &format!("{DID}#key-0")),
+            authentication_key_in(&d, DID, &format!("{DID}#key-0"), chrono::Utc::now()),
             Err(ProofError::Invalid(r)) if r.contains("not controlled")
         ));
     }
@@ -290,7 +332,7 @@ mod tests {
         let d = json!({ "id": DID, "verificationMethod": [vm(DID)],
                         "assertionMethod": [format!("{DID}#key-0")] });
         assert!(matches!(
-            authentication_key_in(&d, DID, &format!("{DID}#key-0")),
+            authentication_key_in(&d, DID, &format!("{DID}#key-0"), chrono::Utc::now()),
             Err(ProofError::Invalid(r)) if r.contains("authentication method")
         ));
     }
@@ -299,12 +341,52 @@ mod tests {
     fn refuses_a_document_for_another_did() {
         let mut d = doc(vm(DID), json!([format!("{DID}#key-0")]));
         d["id"] = json!("did:webvh:scid:elsewhere.example");
-        assert!(authentication_key_in(&d, DID, &format!("{DID}#key-0")).is_err());
+        assert!(
+            authentication_key_in(&d, DID, &format!("{DID}#key-0"), chrono::Utc::now()).is_err()
+        );
+    }
+
+    #[test]
+    fn refuses_a_revoked_or_expired_method() {
+        let now = chrono::Utc::now();
+        let vm_id = format!("{DID}#key-0");
+        let with = |k: &str, v: Value| {
+            let mut m = vm(DID);
+            m[k] = v;
+            doc(m, json!([vm_id.clone()]))
+        };
+        let revoked = with("revoked", json!("2026-01-01T00:00:00Z"));
+        assert!(matches!(authentication_key_in(&revoked, DID, &vm_id, now),
+            Err(ProofError::Invalid(r)) if r.contains("revoked")));
+        let expired = with(
+            "expires",
+            json!((now - chrono::TimeDelta::seconds(1)).to_rfc3339()),
+        );
+        assert!(matches!(authentication_key_in(&expired, DID, &vm_id, now),
+            Err(ProofError::Invalid(r)) if r.contains("expired")));
+        let garbled = with("expires", json!("not a time"));
+        assert!(authentication_key_in(&garbled, DID, &vm_id, now).is_err());
+        let current = with(
+            "expires",
+            json!((now + chrono::TimeDelta::days(1)).to_rfc3339()),
+        );
+        assert!(authentication_key_in(&current, DID, &vm_id, now).is_ok());
+    }
+
+    #[test]
+    fn refuses_an_oversized_document() {
+        let small = doc(vm(DID), json!([format!("{DID}#key-0")]));
+        assert!(check_document_size(&small).is_ok());
+        let mut big = small.clone();
+        big["service"] = json!(["x".repeat(MAX_DID_DOCUMENT_BYTES)]);
+        assert!(check_document_size(&big).is_err());
     }
 
     #[test]
     fn refuses_an_unlisted_method() {
         let d = doc(vm(DID), json!([format!("{DID}#key-0")]));
-        assert!(authentication_key_in(&d, DID, &format!("{DID}#key-9")).is_err());
+        assert!(
+            authentication_key_in(&d, DID, &format!("{DID}#key-9"), chrono::Utc::now()).is_err()
+        );
     }
 }

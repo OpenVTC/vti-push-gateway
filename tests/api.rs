@@ -60,7 +60,7 @@ fn state_with(store: Store, limits: Limits) -> AppState {
         metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
         egress: Arc::new(EgressPolicy::default()),
         limits: Arc::new(limits),
-        replay: Arc::new(trust_tasks_rs::InMemoryReplayGuard::default()),
+        replay: Arc::new(vti_push_gateway::replay::ReplayRecord::default()),
     }
 }
 

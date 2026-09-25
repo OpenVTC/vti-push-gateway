@@ -269,7 +269,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
         egress,
         limits: limits.clone(),
-        replay: Arc::new(trust_tasks_rs::InMemoryReplayGuard::default()),
+        replay: Arc::new(vti_push_gateway::replay::ReplayRecord::default()),
     };
 
     // Start the DIDComm listener (preferred transport) if provisioned.

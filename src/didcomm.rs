@@ -22,10 +22,14 @@
 //! An `authentication` proof carries no challenge, so the document itself is
 //! what binds it to one delivery (VTI-KEY-107): it must name this gateway as
 //! `recipient`, carry an `issuedAt` inside the acceptance window
-//! ([`acceptance_window`], VTI-OPS-024), and an `id` not already accepted
-//! (VTI-OPS-026, the shared [`AppState::replay`] record). A second delivery of
-//! an accepted document is answered with the first response and not executed
-//! again; a different document under an accepted `id` gets `idConflict`.
+//! ([`acceptance_window`], VTI-OPS-024) and not past its `expiresAt`, and an
+//! `id` the same issuer has not already had accepted (VTI-OPS-026, the shared
+//! [`AppState::replay`] record, keyed by (issuer, id)). The record is claimed
+//! only **after** the caller is rate-limited and authorised for the handle, so
+//! a refused caller leaves nothing in it. A second delivery of an accepted
+//! document is answered with the first response and not executed again; a
+//! different document under the same issuer's accepted `id` gets `idConflict`;
+//! a transient push failure releases the claim so a retry is attempted.
 //!
 //! When the envelope does name a sender, it has to agree with the proven
 //! issuer — a mismatch is refused as an identity mismatch rather than resolved
@@ -46,13 +50,13 @@ use affinidi_tdk::didcomm::Message;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use trust_tasks_rs::{
-    document_digest, ConsistencyError, FreshnessPolicy, RejectReason, ReplayGuard, ReplayVerdict,
-    TrustTask,
+    document_digest, ConsistencyError, DocumentDigest, FreshnessPolicy, RejectReason, TrustTask,
 };
 
-use crate::api::{dispatch_push, reject_value, AppState};
+use crate::api::{dispatch_push, dispatch_push_once, reject_value, AdmitOnce, AppState};
 use crate::identity::GatewayIdentity;
 use crate::proof::{ProofError, ProofVerifier};
+use crate::replay::{Admission, ReplayRecord};
 use crate::resolver::ResolverTuning;
 
 /// DIDComm message type wrapping a Trust Task document (the DIDComm binding's
@@ -124,18 +128,27 @@ pub fn acceptance_window() -> FreshnessPolicy {
     FreshnessPolicy::consequential()
 }
 
-/// Admit an authenticated document once (VTI-OPS-024 / VTI-OPS-026).
-///
-/// `Ok(Some(response))` is a duplicate delivery of a document already
-/// executed, answered with what the first execution returned — it is not run
-/// again. `Ok(None)` means the document is fresh and has been claimed.
-async fn admit_once(
-    state: &AppState,
+/// Margin added to the replay record's retention past the last instant the
+/// window accepts a document, so acceptance and record expiry never meet at
+/// the same instant and leave a moment in which a replay is both fresh and
+/// forgotten.
+const RETENTION_MARGIN: chrono::TimeDelta = chrono::TimeDelta::seconds(1);
+
+/// Check an authenticated document's time bounds and identifier
+/// (VTI-OPS-024, VTI-KEY-107) and work out how long its replay record must be
+/// kept. Nothing is claimed here — that happens only once the caller is
+/// authorised ([`DocumentOnce`]).
+fn check_window(
     doc: &TrustTask<Value>,
+    gateway_did: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<Value>, RejectReason> {
+) -> Result<(DocumentDigest, Option<chrono::DateTime<chrono::Utc>>), RejectReason> {
     let policy = acceptance_window();
     doc.validate_freshness(now, &policy)?;
+    // `validate_freshness` does not look at `expiresAt` once `issuedAt` is
+    // present; `validate_basic` refuses `expiresAt <= now` (and re-checks the
+    // recipient).
+    doc.validate_basic(now, gateway_did)?;
     if doc.id.is_empty() {
         return Err(RejectReason::MalformedRequest {
             reason: "document carries no identifier".into(),
@@ -144,40 +157,46 @@ async fn admit_once(
     let digest = document_digest(doc).map_err(|_| RejectReason::MalformedRequest {
         reason: "document cannot be canonicalised".into(),
     })?;
-    // Retained until the document leaves the window — a producer-supplied
-    // `expiresAt` cannot stretch it (`issuedAt` is required by the policy).
-    let window_end = doc
+    // Retained until the last instant the window still accepts the document,
+    // plus a margin. That instant is `issuedAt + max_age + skew` — the same
+    // bound `validate_freshness` applies — or `expiresAt` when that is sooner.
+    // (`record_expiry` alone would stop at `issuedAt + max_age`, `skew` short
+    // of acceptance, which is a replay gap.) `issuedAt` is required by the
+    // policy, so a producer's `expiresAt` can shorten this but never stretch it.
+    let accept_until = doc
         .issued_at
         .zip(policy.max_age)
         .map(|(issued, age)| issued + age + policy.skew);
-    let retain_until = match (policy.record_expiry(doc, now), window_end) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    };
-    match state
-        .replay
-        .claim(&doc.id, &digest, retain_until, now)
-        .await
-    {
-        Ok(ReplayVerdict::Fresh) => Ok(None),
-        Ok(ReplayVerdict::Duplicate {
-            prior_response: Some(prior),
-            ..
-        }) => Ok(Some(prior)),
-        Ok(ReplayVerdict::Duplicate { .. }) => Err(RejectReason::TaskFailed {
-            reason: "this document has already been accepted".into(),
-            details: None,
-        }),
-        Ok(ReplayVerdict::Conflict) => Err(RejectReason::IdConflict),
-        Ok(_) => Err(RejectReason::IdConflict),
-        // Fail closed: without the record a duplicate cannot be ruled out.
-        Err(e) => {
-            tracing::error!(error = %e, "replay record unavailable; refusing");
-            Err(RejectReason::TaskFailed {
-                reason: "replay record unavailable; retry later".into(),
-                details: None,
-            })
-        }
+    let retain_until = match (accept_until, doc.expires_at) {
+        (Some(a), Some(e)) => Some(a.min(e)),
+        (a, e) => a.or(e),
+    }
+    .map(|t| t + RETENTION_MARGIN);
+    Ok((digest, retain_until))
+}
+
+/// The once-only admission of one authenticated document, run by the dispatch
+/// core after the caller is rate-limited and authorised (see
+/// [`crate::api::AdmitOnce`]). The record is keyed by (issuer, id).
+struct DocumentOnce<'a> {
+    replay: &'a ReplayRecord,
+    id: &'a str,
+    digest: DocumentDigest,
+    retain_until: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+}
+
+#[async_trait::async_trait]
+impl AdmitOnce for DocumentOnce<'_> {
+    async fn admit(&self, issuer: &str) -> Result<Admission, RejectReason> {
+        self.replay
+            .claim(issuer, self.id, &self.digest, self.retain_until, self.now)
+            .await
+    }
+    async fn complete(&self, issuer: &str, response: Option<&Value>) {
+        self.replay
+            .complete(issuer, self.id, &self.digest, response)
+            .await;
     }
 }
 
@@ -209,21 +228,19 @@ pub async fn handle_envelope(
         // effect (a fresh opaque handle, bounded by the registry caps).
         return Some(dispatch_push(&state.app, None, &doc).await);
     }
-    match admit_once(&state.app, &doc, chrono::Utc::now()).await {
-        Ok(None) => {}
-        Ok(Some(prior)) => return Some(prior),
+    let now = chrono::Utc::now();
+    let (digest, retain_until) = match check_window(&doc, &state.gateway_did, now) {
+        Ok(v) => v,
         Err(reason) => return refuse(reason),
-    }
-    let response = dispatch_push(&state.app, sender, &doc).await;
-    if let Err(e) = state
-        .app
-        .replay
-        .record_response(&doc.id, Some(&response))
-        .await
-    {
-        tracing::warn!(error = %e, "could not record the response for duplicate delivery");
-    }
-    Some(response)
+    };
+    let once = DocumentOnce {
+        replay: &state.app.replay,
+        id: &doc.id,
+        digest,
+        retain_until,
+        now,
+    };
+    Some(dispatch_push_once(&state.app, sender, &doc, Some(&once)).await)
 }
 
 /// Handler for every `push/*` type. The inner Trust Task doc rides in
@@ -302,4 +319,53 @@ pub async fn start(
     DIDCommService::start(config, router, shutdown)
         .await
         .map_err(|e| format!("DIDComm service start: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn doc(extra: Value) -> TrustTask<Value> {
+        let mut d = serde_json::json!({
+            "id": "urn:uuid:w", "type": "https://trusttasks.org/spec/push/wake/0.2",
+            "recipient": "did:web:gw.example", "payload": {}
+        });
+        d.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(d).unwrap()
+    }
+
+    /// The record outlives the last instant the window accepts the document,
+    /// so there is no instant at which a replay is both fresh and forgotten.
+    #[test]
+    fn retention_ends_after_acceptance_does() {
+        let now = chrono::Utc::now();
+        let issued = now - chrono::TimeDelta::seconds(10);
+        let d = doc(serde_json::json!({ "issuedAt": issued.to_rfc3339() }));
+        let (_, until) = check_window(&d, "did:web:gw.example", now).unwrap();
+        let p = acceptance_window();
+        let last_accepted = issued + p.max_age.unwrap() + p.skew;
+        assert_eq!(until, Some(last_accepted + RETENTION_MARGIN));
+        // A producer's `expiresAt` shortens it, still with the margin.
+        let exp = now + chrono::TimeDelta::seconds(5);
+        let d = doc(
+            serde_json::json!({ "issuedAt": issued.to_rfc3339(), "expiresAt": exp.to_rfc3339() }),
+        );
+        let (_, until) = check_window(&d, "did:web:gw.example", now).unwrap();
+        assert_eq!(until, Some(exp + RETENTION_MARGIN));
+    }
+
+    #[test]
+    fn an_expired_document_fails_the_window() {
+        let now = chrono::Utc::now();
+        let d = doc(serde_json::json!({
+            "issuedAt": (now - chrono::TimeDelta::seconds(30)).to_rfc3339(),
+            "expiresAt": (now - chrono::TimeDelta::seconds(20)).to_rfc3339(),
+        }));
+        assert!(matches!(
+            check_window(&d, "did:web:gw.example", now),
+            Err(RejectReason::Expired { .. })
+        ));
+    }
 }

@@ -37,6 +37,7 @@ use vti_push_gateway::store::{Store, StoreLimits};
 const ENV_MAX_HANDLES: &str = "GATEWAY_MAX_HANDLES";
 const ENV_MAX_PER_TOKEN: &str = "GATEWAY_MAX_HANDLES_PER_TOKEN";
 const ENV_UNPROVISIONED_TTL_SECS: &str = "GATEWAY_UNPROVISIONED_TTL_SECS";
+const ENV_MAX_PER_CONTROLLER: &str = "GATEWAY_MAX_HANDLES_PER_CONTROLLER";
 /// Minimum gap between snapshot writes.
 const ENV_SNAPSHOT_FLUSH_MS: &str = "GATEWAY_SNAPSHOT_FLUSH_MS";
 
@@ -226,6 +227,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Which controller VTAs this gateway serves. A malformed list stops startup
+    // rather than being guessed at; an empty one refuses every registration.
+    let controllers = vti_push_gateway::controllers::ControllerPolicy::from_env()?;
+    match &controllers {
+        vti_push_gateway::controllers::ControllerPolicy::Open => tracing::warn!(
+            "{}=* — OPEN MODE: any controller VTA may register handles here. \
+             Per-controller, per-handle and fair-share limits still apply; \
+             list the VTAs this gateway serves instead.",
+            vti_push_gateway::controllers::ENV_ALLOWED_CONTROLLERS
+        ),
+        vti_push_gateway::controllers::ControllerPolicy::Listed(set) if set.is_empty() => {
+            tracing::error!(
+                "{} is unset or empty — every push/register will be refused. \
+                 List the controller VTA DIDs this gateway serves.",
+                vti_push_gateway::controllers::ENV_ALLOWED_CONTROLLERS
+            )
+        }
+        p => tracing::info!(controllers = %p.summary(), "controller allowlist"),
+    }
+
     // Registry bounds. `push/register` is anonymous, so these are the ceilings on
     // what an unauthenticated caller can make the gateway hold.
     let defaults = StoreLimits::default();
@@ -236,11 +257,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ENV_UNPROVISIONED_TTL_SECS,
             defaults.unprovisioned_ttl_secs,
         ),
+        max_per_controller: env_num(ENV_MAX_PER_CONTROLLER, defaults.max_per_controller),
     };
     tracing::info!(
         max_handles = store_limits.max_handles,
         max_per_token = store_limits.max_per_token,
         unprovisioned_ttl_secs = store_limits.unprovisioned_ttl_secs,
+        max_per_controller = store_limits.max_per_controller,
         "handle registry limits"
     );
 
@@ -269,6 +292,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
         egress,
         limits: limits.clone(),
+        replay: Arc::new(vti_push_gateway::replay::ReplayRecord::default()),
+        controllers: Arc::new(controllers),
     };
 
     // Start the DIDComm listener (preferred transport) if provisioned.

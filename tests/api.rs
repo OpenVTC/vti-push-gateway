@@ -60,6 +60,10 @@ fn state_with(store: Store, limits: Limits) -> AppState {
         metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
         egress: Arc::new(EgressPolicy::default()),
         limits: Arc::new(limits),
+        replay: Arc::new(vti_push_gateway::replay::ReplayRecord::default()),
+        // These suites mint a fresh controller per test; the allowlist has
+        // its own tests.
+        controllers: Arc::new(vti_push_gateway::controllers::ControllerPolicy::Open),
     }
 }
 

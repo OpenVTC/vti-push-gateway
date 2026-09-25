@@ -9,8 +9,9 @@
 //! `TrustTask` and returns the response **document** (a `…#response` or a
 //! `trust-task-error`). Each transport adapter authenticates/unpacks, calls the
 //! core, and delivers the document in its own idiom — `POST /trust-tasks`
-//! (HTTPS, did-signed) here; the DIDComm adapter (added next, the *preferred*
-//! transport) will call the same core with the authcrypt sender. The core is a
+//! (HTTPS, did-signed) here; the DIDComm adapter (the *preferred* transport)
+//! calls the same core with the issuer the document's Data Integrity proof
+//! establishes — never with the envelope's `from` alone. The core is a
 //! function, not a worker task: request/response transports just `await`/call
 //! it (see the architecture note — no dedicated worker, which would bottleneck).
 
@@ -36,9 +37,11 @@ use trust_tasks_rs::{RejectReason, TrustTask};
 use uuid::Uuid;
 
 use crate::auth::{self, HEADER_DID, HEADER_SIG};
+use crate::controllers::ControllerPolicy;
 use crate::egress::EgressPolicy;
 use crate::limits::Limits;
 use crate::metrics::Metrics;
+use crate::replay::{Admission, ReplayRecord};
 use crate::sender::{self, PushSender, SendOutcome};
 use crate::store::{ProvisionOutcome, Store, WakeAuthz};
 use crate::types::{ProvisionRequest, RegisterRequest, WakePayload, WakeRequest};
@@ -79,6 +82,12 @@ pub struct AppState {
     /// Per-operation rate limits. Consulted in [`dispatch_push`] rather than in
     /// HTTP middleware, so the DIDComm transport is covered too.
     pub limits: Arc<Limits>,
+    /// The record of accepted document identifiers (VTI-OPS-026), keyed by
+    /// (issuer, id). One per process and shared by every binding that consults
+    /// it (VTI-OPS-027). See [`crate::replay`].
+    pub replay: Arc<ReplayRecord>,
+    /// Which controller VTAs this gateway serves ([`crate::controllers`]).
+    pub controllers: Arc<ControllerPolicy>,
 }
 
 /// The **public** router: the `push/*` Trust-Task endpoint and a liveness probe.
@@ -181,7 +190,7 @@ fn success_value<R: Serialize>(doc: &TrustTask<Value>, payload: R) -> Value {
 }
 
 /// Serialize a `trust-task-error` document for this request.
-fn reject_value(doc: &TrustTask<Value>, reason: RejectReason) -> Value {
+pub(crate) fn reject_value(doc: &TrustTask<Value>, reason: RejectReason) -> Value {
     serde_json::to_value(doc.reject_with(new_id(), reason)).unwrap_or(Value::Null)
 }
 
@@ -223,13 +232,68 @@ fn parse<T: serde::de::DeserializeOwned>(doc: &TrustTask<Value>) -> Result<T, Va
 
 // ─── The transport-agnostic dispatch core ─────────────────────────────────
 
+/// A once-only admission step a transport may supply for `push/provision` and
+/// `push/wake`. The core runs it **after** the caller has been rate-limited and
+/// authorised and immediately before the effect, so only an authorised caller
+/// ever occupies the replay record, and a refused caller leaves nothing behind.
+#[async_trait::async_trait]
+pub trait AdmitOnce: Send + Sync {
+    /// Claim the document for `issuer`. [`Admission::Answered`] means it was
+    /// already executed: the core returns that response and does nothing.
+    async fn admit(&self, issuer: &str, handle: &str) -> Result<Admission, RejectReason>;
+    /// The effect ran and produced `response` (kept for a later duplicate), or
+    /// — with `None` — it did not happen and the claim is released so the same
+    /// document may be attempted again.
+    async fn complete(&self, issuer: &str, handle: &str, response: Option<&Value>);
+}
+
+/// Run `once.admit`, mapping the outcome to "proceed" or an answer to return.
+async fn admit(
+    once: Option<&dyn AdmitOnce>,
+    issuer: &str,
+    handle: &str,
+    doc: &TrustTask<Value>,
+) -> Result<(), Value> {
+    let Some(once) = once else { return Ok(()) };
+    match once.admit(issuer, handle).await {
+        Ok(Admission::Fresh) => Ok(()),
+        Ok(Admission::Answered(prior)) => Err(prior),
+        Err(reason) => Err(reject_value(doc, reason)),
+    }
+}
+
+async fn complete(
+    once: Option<&dyn AdmitOnce>,
+    issuer: &str,
+    handle: &str,
+    response: Option<&Value>,
+) {
+    if let Some(once) = once {
+        once.complete(issuer, handle, response).await;
+    }
+}
+
 /// Perform a `push/*` operation and return the response document. `sender` is
 /// the authenticated caller DID (`None` if the transport authenticated no one —
 /// allowed for `push/register`). Shared by every transport adapter.
+///
+/// "Authenticated" means proven by a signature the adapter verified — the HTTPS
+/// body signature, or the document's Data Integrity proof on DIDComm. A
+/// transport's own claim about its sender is not enough to pass here.
 pub(crate) async fn dispatch_push(
     state: &AppState,
     sender: Option<String>,
     doc: &TrustTask<Value>,
+) -> Value {
+    dispatch_push_once(state, sender, doc, None).await
+}
+
+/// [`dispatch_push`] with a once-only admission step (see [`AdmitOnce`]).
+pub(crate) async fn dispatch_push_once(
+    state: &AppState,
+    sender: Option<String>,
+    doc: &TrustTask<Value>,
+    once: Option<&dyn AdmitOnce>,
 ) -> Value {
     let uri = &doc.type_uri;
     match (uri.slug(), uri.major(), uri.minor()) {
@@ -259,7 +323,7 @@ pub(crate) async fn dispatch_push(
                     return rate_limited(doc, "push/provision");
                 }
             }
-            handle_provision(state, sender, doc).await
+            handle_provision(state, sender, doc, once).await
         }
         ("push/wake", 0, 2) => {
             if let Some(caller) = sender.as_deref() {
@@ -267,7 +331,7 @@ pub(crate) async fn dispatch_push(
                     return rate_limited(doc, "push/wake");
                 }
             }
-            handle_wake(state, sender, doc).await
+            handle_wake(state, sender, doc, once).await
         }
         _ => reject_value(
             doc,
@@ -289,6 +353,17 @@ async fn handle_register(state: &AppState, doc: &TrustTask<Value>) -> Value {
     };
     if let Err(reason) = req.validate(&state.egress) {
         return malformed(doc, reason);
+    }
+    // Only a controller this gateway serves may be named (checked before a
+    // sender is selected or anything is stored).
+    if !state.controllers.allows(&req.controller_vta_did) {
+        tracing::warn!("refusing registration naming a controller this gateway does not serve");
+        return reject_value(
+            doc,
+            RejectReason::PermissionDenied {
+                reason: "controller VTA is not served by this gateway".into(),
+            },
+        );
     }
     if sender::select(&state.senders, &req.registration).is_none() {
         return reject_value(
@@ -327,6 +402,7 @@ async fn handle_provision(
     state: &AppState,
     sender: Option<String>,
     doc: &TrustTask<Value>,
+    once: Option<&dyn AdmitOnce>,
 ) -> Value {
     let Some(caller) = sender else {
         return reject_value(doc, RejectReason::ProofRequired);
@@ -341,14 +417,65 @@ async fn handle_provision(
         return malformed(doc, reason);
     }
     let triggers = req.policy.allowed_triggers.clone();
+    // A controller this gateway no longer serves (the list narrowed since the
+    // handle was registered) cannot provision it.
+    if !state.controllers.allows(&caller) {
+        state.metrics.inc_provision_not_controller();
+        return reject_value(
+            doc,
+            RejectReason::PermissionDenied {
+                reason: "controller VTA is not served by this gateway".into(),
+            },
+        );
+    }
+    // Authorise before admitting: a caller that is not the controller (or names
+    // no handle) is refused without touching the replay record.
+    match state.store.check_controller(&req.handle, &caller) {
+        ProvisionOutcome::Ok => {}
+        refused => return provision_refused(state, doc, refused),
+    }
+    // Re-applying the stored allowlist changes nothing, so it is answered
+    // without spending a replay record: replaying it is harmless by
+    // construction.
+    if state.store.allowlist_is(&req.handle, &triggers) {
+        state.metrics.inc_provision_ok();
+        return success_value(
+            doc,
+            json!({ "handle": req.handle, "policy": { "allowedTriggers": triggers } }),
+        );
+    }
+    if let Err(answer) = admit(once, &caller, &req.handle, doc).await {
+        return answer;
+    }
     match state.store.provision(&req.handle, &caller, req.policy) {
         ProvisionOutcome::Ok => {
             state.metrics.inc_provision_ok();
-            success_value(
+            let response = success_value(
                 doc,
                 json!({ "handle": req.handle, "policy": { "allowedTriggers": triggers } }),
-            )
+            );
+            complete(once, &caller, &req.handle, Some(&response)).await;
+            response
         }
+        // The handle changed between the check and the write: nothing was
+        // applied, so release the claim.
+        refused => {
+            complete(once, &caller, &req.handle, None).await;
+            provision_refused(state, doc, refused)
+        }
+    }
+}
+
+fn provision_refused(state: &AppState, doc: &TrustTask<Value>, outcome: ProvisionOutcome) -> Value {
+    match outcome {
+        // Not a refusal; never passed here, but answered safely if it were.
+        ProvisionOutcome::Ok => reject_value(
+            doc,
+            RejectReason::TaskFailed {
+                reason: "provision was not applied".into(),
+                details: None,
+            },
+        ),
         ProvisionOutcome::UnknownHandle => {
             state.metrics.inc_provision_unknown_handle();
             reject_value(
@@ -372,7 +499,12 @@ async fn handle_provision(
 }
 
 /// `push/wake` — fire the contentless doorbell iff the trigger is allowlisted.
-async fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<Value>) -> Value {
+async fn handle_wake(
+    state: &AppState,
+    sender: Option<String>,
+    doc: &TrustTask<Value>,
+    once: Option<&dyn AdmitOnce>,
+) -> Value {
     let Some(trigger) = sender else {
         return reject_value(doc, RejectReason::ProofRequired);
     };
@@ -414,6 +546,10 @@ async fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<V
             },
         );
     };
+    // Authorised (allowlisted, with a sender for its platform): admit once.
+    if let Err(answer) = admit(once, &trigger, &req.handle, doc).await {
+        return answer;
+    }
     let payload = WakePayload {
         v: req.v,
         mediator: req.mediator,
@@ -435,10 +571,15 @@ async fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<V
     match outcome {
         SendOutcome::Delivered => {
             state.metrics.inc_wake_delivered();
-            success_value(doc, json!({ "status": "delivered" }))
+            let response = success_value(doc, json!({ "status": "delivered" }));
+            complete(once, &trigger, &req.handle, Some(&response)).await;
+            response
         }
         SendOutcome::TransientFailure => {
             state.metrics.inc_wake_transient_failure();
+            // Nothing was delivered: release the claim so a retry of the same
+            // document is attempted rather than answered with this failure.
+            complete(once, &trigger, &req.handle, None).await;
             reject_value(
                 doc,
                 RejectReason::TaskFailed {
@@ -452,7 +593,9 @@ async fn handle_wake(state: &AppState, sender: Option<String>, doc: &TrustTask<V
             // (`tokenUnregistered` is the 0.2 spelling of the status enum.)
             state.store.remove(&req.handle);
             state.metrics.inc_wake_token_unregistered();
-            success_value(doc, json!({ "status": "tokenUnregistered" }))
+            let response = success_value(doc, json!({ "status": "tokenUnregistered" }));
+            complete(once, &trigger, &req.handle, Some(&response)).await;
+            response
         }
     }
 }

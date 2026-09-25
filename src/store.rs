@@ -90,6 +90,10 @@ pub struct StoreLimits {
     pub max_per_token: usize,
     /// How long a handle may stay unprovisioned before it is swept.
     pub unprovisioned_ttl_secs: u64,
+    /// Live handles naming one controller VTA DID. `register` is anonymous
+    /// and names its controller freely, so this bounds what one invented
+    /// controller can hold.
+    pub max_per_controller: usize,
 }
 
 impl Default for StoreLimits {
@@ -97,7 +101,11 @@ impl Default for StoreLimits {
         Self {
             max_handles: 100_000,
             max_per_token: 4,
-            unprovisioned_ttl_secs: 24 * 60 * 60,
+            // A handle is provisioned by its VTA straight after the device
+            // registers it (`device/set-wake`); one that is not within an
+            // hour is not going to be.
+            unprovisioned_ttl_secs: 60 * 60,
+            max_per_controller: 4_096,
         }
     }
 }
@@ -109,6 +117,8 @@ pub enum InsertError {
     AtCapacity,
     /// This push token already has [`StoreLimits::max_per_token`] live handles.
     TooManyForToken,
+    /// The named controller already has [`StoreLimits::max_per_controller`].
+    TooManyForController,
 }
 
 impl InsertError {
@@ -117,6 +127,7 @@ impl InsertError {
         match self {
             InsertError::AtCapacity => "gateway at capacity",
             InsertError::TooManyForToken => "too many handles for this push token",
+            InsertError::TooManyForController => "too many handles for this controller",
         }
     }
 }
@@ -416,6 +427,15 @@ impl Store {
         if state.handles.len() >= self.limits.max_handles {
             return Err(InsertError::AtCapacity);
         }
+        if state
+            .handles
+            .values()
+            .filter(|r| r.controller_vta_did == controller_vta_did)
+            .count()
+            >= self.limits.max_per_controller
+        {
+            return Err(InsertError::TooManyForController);
+        }
         let digest = token_digest(&registration);
         if state
             .by_token
@@ -459,6 +479,16 @@ impl Store {
             self.mark_dirty();
         }
         outcome
+    }
+
+    /// Whether `handle`'s stored allowlist is already exactly `triggers` — a
+    /// provision that would change nothing.
+    pub fn allowlist_is(&self, handle: &str, triggers: &[String]) -> bool {
+        let state = self.state.read().unwrap();
+        state
+            .handles
+            .get(handle)
+            .is_some_and(|rec| rec.allowed_triggers == triggers)
     }
 
     /// Whether `caller_did` is `handle`'s controller VTA — the authorisation
@@ -907,6 +937,28 @@ mod tests {
     }
 
     /// An unprovisioned handle disappears once the TTL has passed; a provisioned
+    /// One controller DID holds at most `max_per_controller` handles.
+    #[test]
+    fn registrations_per_controller_are_bounded() {
+        let store = Store::with_limits(StoreLimits {
+            max_per_controller: 2,
+            ..StoreLimits::default()
+        });
+        store
+            .insert("a".into(), apns_n(1), CONTROLLER.into())
+            .unwrap();
+        store
+            .insert("b".into(), apns_n(2), CONTROLLER.into())
+            .unwrap();
+        assert_eq!(
+            store.insert("c".into(), apns_n(3), CONTROLLER.into()),
+            Err(InsertError::TooManyForController)
+        );
+        store
+            .insert("d".into(), apns_n(4), "did:web:other.example".into())
+            .unwrap();
+    }
+
     /// one is never swept, however old.
     #[test]
     fn sweep_drops_only_stale_unprovisioned_handles() {

@@ -188,14 +188,21 @@ struct DocumentOnce<'a> {
 
 #[async_trait::async_trait]
 impl AdmitOnce for DocumentOnce<'_> {
-    async fn admit(&self, issuer: &str) -> Result<Admission, RejectReason> {
+    async fn admit(&self, issuer: &str, handle: &str) -> Result<Admission, RejectReason> {
         self.replay
-            .claim(issuer, self.id, &self.digest, self.retain_until, self.now)
+            .claim(
+                issuer,
+                handle,
+                self.id,
+                &self.digest,
+                self.retain_until,
+                self.now,
+            )
             .await
     }
-    async fn complete(&self, issuer: &str, response: Option<&Value>) {
+    async fn complete(&self, issuer: &str, handle: &str, response: Option<&Value>) {
         self.replay
-            .complete(issuer, self.id, &self.digest, response)
+            .complete(issuer, handle, self.id, &self.digest, response)
             .await;
     }
 }

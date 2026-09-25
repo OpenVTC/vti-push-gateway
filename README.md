@@ -131,7 +131,30 @@ authorised for the handle, so a refused caller leaves nothing in it. A second
 delivery of an accepted document is answered with the first response and not
 executed again; a different document under the same issuer's accepted `id`
 gets `idConflict`; a transient push failure is not remembered, so a retry is
-attempted. The record is in memory and per process.
+attempted. A provision that re-applies the stored allowlist changes nothing and
+spends no record. The record is in memory and per process.
+
+**Who can spend the record.** `push/register` is anonymous and names its
+`controllerVtaDid` freely, so anyone can make a DID they hold the controller of
+a handle and then send it correctly signed provisions. A proof from the
+controller at registration would not change that — the attacker *is* that
+controller — so the gateway does not pretend otherwise. What it guarantees:
+
+- a handle's controller spends record only by a signed, authorised provision
+  that changes the allowlist; an unprovisioned handle holds nothing and is
+  swept after `GATEWAY_UNPROVISIONED_TTL_SECS` (default 1 h);
+- one controller DID holds at most `GATEWAY_MAX_HANDLES_PER_CONTROLLER` handles
+  (default 4096);
+- the record has three budgets — per issuer (8192), per handle (512, shared by
+  the controller and every trigger acting on it), and overall. At the overall
+  soft bound (65536) an issuer is admitted only while it holds less than its
+  fair share (soft bound ÷ issuers holding records), so a set of invented
+  controllers cannot lock out an issuer that is not flooding; a hard bound of
+  twice the soft bound caps memory. A refusal is `taskFailed`, retryable later.
+
+Registration itself stays anonymous and is rate-limited globally (and per peer
+IP over HTTPS); the DIDComm path has no trustworthy anonymous source to key a
+per-source budget on.
 
 `push/provision` then requires that issuer to be the handle's
 `controllerVtaDid`; `push/wake` requires it to be on the allowlist. The DIDComm
@@ -196,7 +219,9 @@ cargo run
 #                       loopback).
 # Registry bounds (push/register is anonymous, so these cap what an
 # unauthenticated caller can make the gateway hold; all optional):
-# GATEWAY_UNPROVISIONED_TTL_SECS=86400   drop a handle whose VTA never
+# GATEWAY_MAX_HANDLES_PER_CONTROLLER=4096   live handles naming one
+#                       controller VTA DID.
+# GATEWAY_UNPROVISIONED_TTL_SECS=3600   drop a handle whose VTA never
 #                       provisioned a trigger after this long. A provisioned
 #                       handle is never swept. This is the main bound on
 #                       anonymous growth; the sweeper runs every 60s.
@@ -406,12 +431,13 @@ Trust Task is pulled from the mediator.
   credentials, so it is rate-limited, capped, and expiring:
   - **Expiry is the root-cause fix.** A freshly registered handle is inert until
     its VTA provisions a trigger, so a handle still unprovisioned after
-    `GATEWAY_UNPROVISIONED_TTL_SECS` (default 24 h) is swept. Anonymous growth
+    `GATEWAY_UNPROVISIONED_TTL_SECS` (default 1 h) is swept. Anonymous growth
     becomes bounded churn instead of a monotonic leak. A provisioned handle is
     never swept, however old.
   - **Caps:** `GATEWAY_MAX_HANDLES` in total, and
     `GATEWAY_MAX_HANDLES_PER_TOKEN` live handles per device token / Web Push
-    endpoint, so one token cannot occupy the registry.
+    endpoint, so one token cannot occupy the registry, and
+    `GATEWAY_MAX_HANDLES_PER_CONTROLLER` per named controller DID.
   - **Rate limits in two layers**, because the DIDComm transport — the preferred
     one — never passes through HTTP middleware. A `tower_governor` layer limits
     `POST /trust-tasks` per peer IP (429), and the transport-agnostic dispatch

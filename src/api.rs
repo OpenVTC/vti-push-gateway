@@ -237,30 +237,36 @@ fn parse<T: serde::de::DeserializeOwned>(doc: &TrustTask<Value>) -> Result<T, Va
 pub trait AdmitOnce: Send + Sync {
     /// Claim the document for `issuer`. [`Admission::Answered`] means it was
     /// already executed: the core returns that response and does nothing.
-    async fn admit(&self, issuer: &str) -> Result<Admission, RejectReason>;
+    async fn admit(&self, issuer: &str, handle: &str) -> Result<Admission, RejectReason>;
     /// The effect ran and produced `response` (kept for a later duplicate), or
     /// — with `None` — it did not happen and the claim is released so the same
     /// document may be attempted again.
-    async fn complete(&self, issuer: &str, response: Option<&Value>);
+    async fn complete(&self, issuer: &str, handle: &str, response: Option<&Value>);
 }
 
 /// Run `once.admit`, mapping the outcome to "proceed" or an answer to return.
 async fn admit(
     once: Option<&dyn AdmitOnce>,
     issuer: &str,
+    handle: &str,
     doc: &TrustTask<Value>,
 ) -> Result<(), Value> {
     let Some(once) = once else { return Ok(()) };
-    match once.admit(issuer).await {
+    match once.admit(issuer, handle).await {
         Ok(Admission::Fresh) => Ok(()),
         Ok(Admission::Answered(prior)) => Err(prior),
         Err(reason) => Err(reject_value(doc, reason)),
     }
 }
 
-async fn complete(once: Option<&dyn AdmitOnce>, issuer: &str, response: Option<&Value>) {
+async fn complete(
+    once: Option<&dyn AdmitOnce>,
+    issuer: &str,
+    handle: &str,
+    response: Option<&Value>,
+) {
     if let Some(once) = once {
-        once.complete(issuer, response).await;
+        once.complete(issuer, handle, response).await;
     }
 }
 
@@ -403,7 +409,17 @@ async fn handle_provision(
         ProvisionOutcome::Ok => {}
         refused => return provision_refused(state, doc, refused),
     }
-    if let Err(answer) = admit(once, &caller, doc).await {
+    // Re-applying the stored allowlist changes nothing, so it is answered
+    // without spending a replay record: replaying it is harmless by
+    // construction.
+    if state.store.allowlist_is(&req.handle, &triggers) {
+        state.metrics.inc_provision_ok();
+        return success_value(
+            doc,
+            json!({ "handle": req.handle, "policy": { "allowedTriggers": triggers } }),
+        );
+    }
+    if let Err(answer) = admit(once, &caller, &req.handle, doc).await {
         return answer;
     }
     match state.store.provision(&req.handle, &caller, req.policy) {
@@ -413,13 +429,13 @@ async fn handle_provision(
                 doc,
                 json!({ "handle": req.handle, "policy": { "allowedTriggers": triggers } }),
             );
-            complete(once, &caller, Some(&response)).await;
+            complete(once, &caller, &req.handle, Some(&response)).await;
             response
         }
         // The handle changed between the check and the write: nothing was
         // applied, so release the claim.
         refused => {
-            complete(once, &caller, None).await;
+            complete(once, &caller, &req.handle, None).await;
             provision_refused(state, doc, refused)
         }
     }
@@ -506,7 +522,7 @@ async fn handle_wake(
         );
     };
     // Authorised (allowlisted, with a sender for its platform): admit once.
-    if let Err(answer) = admit(once, &trigger, doc).await {
+    if let Err(answer) = admit(once, &trigger, &req.handle, doc).await {
         return answer;
     }
     let payload = WakePayload {
@@ -531,14 +547,14 @@ async fn handle_wake(
         SendOutcome::Delivered => {
             state.metrics.inc_wake_delivered();
             let response = success_value(doc, json!({ "status": "delivered" }));
-            complete(once, &trigger, Some(&response)).await;
+            complete(once, &trigger, &req.handle, Some(&response)).await;
             response
         }
         SendOutcome::TransientFailure => {
             state.metrics.inc_wake_transient_failure();
             // Nothing was delivered: release the claim so a retry of the same
             // document is attempted rather than answered with this failure.
-            complete(once, &trigger, None).await;
+            complete(once, &trigger, &req.handle, None).await;
             reject_value(
                 doc,
                 RejectReason::TaskFailed {
@@ -553,7 +569,7 @@ async fn handle_wake(
             state.store.remove(&req.handle);
             state.metrics.inc_wake_token_unregistered();
             let response = success_value(doc, json!({ "status": "tokenUnregistered" }));
-            complete(once, &trigger, Some(&response)).await;
+            complete(once, &trigger, &req.handle, Some(&response)).await;
             response
         }
     }

@@ -616,3 +616,87 @@ async fn a_refused_provision_leaves_no_record() {
     );
     assert_eq!(st.app.replay.len_for(&other.did), 0);
 }
+
+// ── Regression: self-registered controllers cannot exhaust the record ───
+
+/// Anonymous registration lets anyone make a DID of their own the controller
+/// of a handle. A set of such controllers sending fresh provisions must not
+/// fill the record and lock a legitimate issuer out.
+#[tokio::test]
+async fn self_registered_controllers_cannot_lock_others_out() {
+    let st = with_record(
+        didcomm_state().await,
+        vti_push_gateway::replay::ReplayRecord::new(8192, 100),
+    );
+    let legit_vta = Party::new();
+    let legit_trig = Party::new();
+    let lh = provisioned(&st, &legit_vta, &[&legit_trig.did]).await;
+    for _ in 0..3 {
+        let a = Party::new();
+        let ah = register(&st, &a.did).await;
+        for _ in 0..40 {
+            // A different allowlist each time, so none is a no-op.
+            let other = Party::new();
+            let p = a.sign(provision_doc(&a.did, &ah, &other.did)).await;
+            send(&st, None, &p).await;
+        }
+    }
+    let r = send(
+        &st,
+        None,
+        &legit_trig.sign(wake_doc(&legit_trig.did, &lh)).await,
+    )
+    .await;
+    assert!(
+        is_success(&r),
+        "a legitimate issuer under its share is still admitted: {r}"
+    );
+}
+
+/// The reviewer's probe as written: the same provision re-applied under fresh
+/// ids changes nothing, so it spends no record at all.
+#[tokio::test]
+async fn reapplying_the_stored_allowlist_spends_no_record() {
+    let st = didcomm_state().await;
+    let a = Party::new();
+    let ah = register(&st, &a.did).await;
+    for _ in 0..40 {
+        let p = a.sign(provision_doc(&a.did, &ah, &a.did)).await;
+        assert!(is_success(&send(&st, None, &p).await));
+    }
+    assert_eq!(
+        st.app.replay.len_for(&a.did),
+        1,
+        "only the provision that changed something"
+    );
+}
+
+/// Everyone acting on one handle shares its budget, whichever DIDs they use.
+#[tokio::test]
+async fn one_handle_cannot_spend_more_than_its_budget() {
+    let st = with_record(
+        didcomm_state().await,
+        vti_push_gateway::replay::ReplayRecord::with_per_handle(8192, 3, 65_536),
+    );
+    let vta = Party::new();
+    let triggers: Vec<Party> = (0..4).map(|_| Party::new()).collect();
+    let dids: Vec<&str> = triggers.iter().map(|t| t.did.as_str()).collect();
+    let handle = provisioned(&st, &vta, &dids).await; // 1 record
+    let mut ok = 0;
+    for t in &triggers {
+        if is_success(&send(&st, None, &t.sign(wake_doc(&t.did, &handle)).await).await) {
+            ok += 1;
+        }
+    }
+    assert_eq!(ok, 2, "the handle's 3-record budget: 1 provision + 2 wakes");
+    assert_eq!(st.app.replay.len_for_handle(&handle), 3);
+    // Another handle is unaffected.
+    let other = provisioned(&st, &vta, &[&triggers[0].did]).await;
+    let r = send(
+        &st,
+        None,
+        &triggers[0].sign(wake_doc(&triggers[0].did, &other)).await,
+    )
+    .await;
+    assert!(is_success(&r), "{r}");
+}

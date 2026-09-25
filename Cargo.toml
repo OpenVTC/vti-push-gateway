@@ -42,6 +42,9 @@ affinidi-secrets-resolver = "0.5"
 # or `push/wake` document carries on the DIDComm path — the caller is the
 # document issuer that proof establishes, not the envelope sender (src/proof.rs).
 affinidi-data-integrity = "0.7.13"
+# The acceptance window for a document's `issuedAt` and the retention of the
+# replay record (src/didcomm.rs). Already in the tree via trust-tasks-rs.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 0.8.37 is a floor, not cosmetic: it is the first release whose did:web **and**
 # did:webvh resolvers refuse non-public hosts by default (didwebvh-rs 0.7's
 # `HostPolicy`). A DID names the host its document is fetched from, and the

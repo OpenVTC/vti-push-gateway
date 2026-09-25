@@ -2,6 +2,14 @@
 //! over DIDComm: an `eddsa-jcs-2022` Data Integrity proof on the Trust Task
 //! document, bound to the document's `issuer`.
 //!
+//! These are a service's own operational messages, not attestations, so the
+//! proof is made with the issuer's **operational** key and carries
+//! `proofPurpose: authentication` (VTI-KEY-106); `assertionMethod` is reserved
+//! for attestation artefacts and is refused here. An `authentication` proof
+//! carries no challenge, so what binds it to one delivery is the document's
+//! recipient, time of issue and identifier — checked by the caller
+//! (`didcomm::authenticate`, VTI-KEY-107).
+//!
 //! The HTTPS adapter authenticates a caller by a signature over the request
 //! body (`auth.rs`). The DIDComm adapter now asks for the equivalent, carried
 //! in-band: the controller VTA (or trigger) signs the Trust Task document, and
@@ -13,13 +21,13 @@
 //! in order:
 //!
 //! 1. the document carries a string `issuer` and a `proof`;
-//! 2. the proof is `eddsa-jcs-2022` with `proofPurpose: assertionMethod`;
+//! 2. the proof is `eddsa-jcs-2022` with `proofPurpose: authentication`;
 //! 3. the DID part of `proof.verificationMethod` **is** the `issuer` (exact
 //!    string equality, no normalisation);
 //! 4. the issuer's DID document lists that verification method, the method's
 //!    `controller` **is** the issuer, and the method is referenced (or
-//!    embedded) under `assertionMethod` — a key the DID lists only for key
-//!    agreement or authentication does not sign documents for it;
+//!    embedded) under `authentication` — a key the DID lists only for key
+//!    agreement or for attestations does not authenticate its messages;
 //! 5. the signature verifies over the document with `proof` removed, against
 //!    the key from step 4.
 //!
@@ -42,7 +50,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 /// The only proof purpose accepted on a `push/*` document.
-pub const PROOF_PURPOSE: &str = "assertionMethod";
+pub const PROOF_PURPOSE: &str = "authentication";
+
+/// The DID-document verification relationship the proof's method must be in.
+const RELATIONSHIP: &str = "authentication";
 
 /// Ed25519 public-key multicodec prefix (`0xed 0x01`).
 const ED25519_MULTICODEC: [u8; 2] = [0xed, 0x01];
@@ -101,7 +112,7 @@ impl ProofVerifier {
             return Err(invalid("proof cryptosuite must be eddsa-jcs-2022"));
         }
         if proof.proof_purpose != PROOF_PURPOSE {
-            return Err(invalid("proof purpose must be assertionMethod"));
+            return Err(invalid("proof purpose must be authentication"));
         }
 
         let vm = proof.verification_method.as_str();
@@ -114,7 +125,7 @@ impl ProofVerifier {
             ));
         }
 
-        let key = self.assertion_key(issuer, vm).await?;
+        let key = self.authentication_key(issuer, vm).await?;
 
         let mut unsigned = raw.clone();
         if let Some(obj) = unsigned.as_object_mut() {
@@ -136,20 +147,20 @@ impl ProofVerifier {
 
     /// Resolve `issuer` and return the Ed25519 key of verification method `vm`,
     /// provided the document lists it, it is controlled by `issuer`, and it is
-    /// an `assertionMethod` of `issuer`.
-    async fn assertion_key(&self, issuer: &str, vm: &str) -> Result<ResolvedKey, ProofError> {
+    /// an `authentication` method of `issuer`.
+    async fn authentication_key(&self, issuer: &str, vm: &str) -> Result<ResolvedKey, ProofError> {
         let resolved = self.client.resolve(issuer).await.map_err(|e| {
             tracing::debug!(error = %e, issuer, "could not resolve the proof issuer");
             invalid("could not resolve the proof issuer's DID document")
         })?;
         let doc = serde_json::to_value(&resolved.doc)
             .map_err(|_| invalid("issuer DID document did not serialise"))?;
-        assertion_key_in(&doc, issuer, vm)
+        authentication_key_in(&doc, issuer, vm)
     }
 }
 
 /// Step 4 over an already-resolved DID document (split out for testing).
-pub(crate) fn assertion_key_in(
+pub(crate) fn authentication_key_in(
     doc: &Value,
     issuer: &str,
     vm: &str,
@@ -165,9 +176,9 @@ pub(crate) fn assertion_key_in(
         .into_iter()
         .flatten()
         .chain(
-            // An `assertionMethod` entry may embed its method rather than
+            // An `authentication` entry may embed its method rather than
             // reference one from `verificationMethod`.
-            doc.get("assertionMethod")
+            doc.get(RELATIONSHIP)
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
@@ -184,8 +195,8 @@ pub(crate) fn assertion_key_in(
         ));
     }
 
-    let is_assertion = doc
-        .get("assertionMethod")
+    let is_listed = doc
+        .get(RELATIONSHIP)
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -194,9 +205,9 @@ pub(crate) fn assertion_key_in(
             Value::Object(o) => o.get("id").and_then(Value::as_str).is_some_and(same_vm),
             _ => false,
         });
-    if !is_assertion {
+    if !is_listed {
         return Err(invalid(
-            "the proof's verificationMethod is not an assertionMethod of the issuer",
+            "the proof's verificationMethod is not an authentication method of the issuer",
         ));
     }
 
@@ -224,7 +235,7 @@ fn absolute(did: &str, id: &str) -> String {
     }
 }
 
-/// A resolver that answers with the one key [`assertion_key_in`] already
+/// A resolver that answers with the one key [`authentication_key_in`] already
 /// selected, so the signature is checked against exactly that key.
 struct PinnedKey(ResolvedKey);
 
@@ -246,8 +257,8 @@ mod tests {
     const DID: &str = "did:webvh:scid:vta.example";
     const KEY_MB: &str = "z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
-    fn doc(vm: Value, assertion: Value) -> Value {
-        json!({ "id": DID, "verificationMethod": [vm], "assertionMethod": assertion })
+    fn doc(vm: Value, relationship: Value) -> Value {
+        json!({ "id": DID, "verificationMethod": [vm], "authentication": relationship })
     }
 
     fn vm(controller: &str) -> Value {
@@ -256,30 +267,31 @@ mod tests {
     }
 
     #[test]
-    fn accepts_an_assertion_method_controlled_by_the_issuer() {
+    fn accepts_an_authentication_method_controlled_by_the_issuer() {
         let d = doc(vm(DID), json!([format!("{DID}#key-0")]));
-        assert!(assertion_key_in(&d, DID, &format!("{DID}#key-0")).is_ok());
+        assert!(authentication_key_in(&d, DID, &format!("{DID}#key-0")).is_ok());
         // Relative references resolve against the issuer.
         let d = doc(vm(DID), json!(["#key-0"]));
-        assert!(assertion_key_in(&d, DID, &format!("{DID}#key-0")).is_ok());
+        assert!(authentication_key_in(&d, DID, &format!("{DID}#key-0")).is_ok());
     }
 
     #[test]
     fn refuses_a_method_controlled_by_someone_else() {
         let d = doc(vm("did:key:zOther"), json!([format!("{DID}#key-0")]));
         assert!(matches!(
-            assertion_key_in(&d, DID, &format!("{DID}#key-0")),
+            authentication_key_in(&d, DID, &format!("{DID}#key-0")),
             Err(ProofError::Invalid(r)) if r.contains("not controlled")
         ));
     }
 
     #[test]
-    fn refuses_a_method_that_is_not_an_assertion_method() {
+    fn refuses_a_method_listed_only_for_attestation() {
+        // An attestation key does not authenticate the issuer's messages.
         let d = json!({ "id": DID, "verificationMethod": [vm(DID)],
-                        "authentication": [format!("{DID}#key-0")] });
+                        "assertionMethod": [format!("{DID}#key-0")] });
         assert!(matches!(
-            assertion_key_in(&d, DID, &format!("{DID}#key-0")),
-            Err(ProofError::Invalid(r)) if r.contains("assertionMethod")
+            authentication_key_in(&d, DID, &format!("{DID}#key-0")),
+            Err(ProofError::Invalid(r)) if r.contains("authentication method")
         ));
     }
 
@@ -287,12 +299,12 @@ mod tests {
     fn refuses_a_document_for_another_did() {
         let mut d = doc(vm(DID), json!([format!("{DID}#key-0")]));
         d["id"] = json!("did:webvh:scid:elsewhere.example");
-        assert!(assertion_key_in(&d, DID, &format!("{DID}#key-0")).is_err());
+        assert!(authentication_key_in(&d, DID, &format!("{DID}#key-0")).is_err());
     }
 
     #[test]
     fn refuses_an_unlisted_method() {
         let d = doc(vm(DID), json!([format!("{DID}#key-0")]));
-        assert!(assertion_key_in(&d, DID, &format!("{DID}#key-9")).is_err());
+        assert!(authentication_key_in(&d, DID, &format!("{DID}#key-9")).is_err());
     }
 }

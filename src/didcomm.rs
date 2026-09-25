@@ -15,9 +15,17 @@
 //! on the Trust Task document itself ([`crate::proof`]), exactly as the HTTPS
 //! adapter authenticates by a signature over the body: the caller is the
 //! document's `issuer`, and only once the proof binds that issuer to one of its
-//! own `assertionMethod` keys. A document without a proof reaches the core as
+//! own `authentication` keys (VTI-KEY-106). A document without a proof reaches the core as
 //! anonymous, so `push/register` (anonymous by design) still works and
 //! `push/provision` / `push/wake` are refused with `proofRequired`.
+//!
+//! An `authentication` proof carries no challenge, so the document itself is
+//! what binds it to one delivery (VTI-KEY-107): it must name this gateway as
+//! `recipient`, carry an `issuedAt` inside the acceptance window
+//! ([`acceptance_window`], VTI-OPS-024), and an `id` not already accepted
+//! (VTI-OPS-026, the shared [`AppState::replay`] record). A second delivery of
+//! an accepted document is answered with the first response and not executed
+//! again; a different document under an accepted `id` gets `idConflict`.
 //!
 //! When the envelope does name a sender, it has to agree with the proven
 //! issuer — a mismatch is refused as an identity mismatch rather than resolved
@@ -37,7 +45,10 @@ use affinidi_tdk::common::profiles::TDKProfile;
 use affinidi_tdk::didcomm::Message;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use trust_tasks_rs::{ConsistencyError, RejectReason, TrustTask};
+use trust_tasks_rs::{
+    document_digest, ConsistencyError, FreshnessPolicy, RejectReason, ReplayGuard, ReplayVerdict,
+    TrustTask,
+};
 
 use crate::api::{dispatch_push, reject_value, AppState};
 use crate::identity::GatewayIdentity;
@@ -83,6 +94,13 @@ pub async fn authenticate(
         Err(ProofError::Missing) => return Ok(None),
         Err(ProofError::Invalid(reason)) => return Err(RejectReason::ProofInvalid { reason }),
     };
+    // VTI-KEY-107: an `authentication` proof has no challenge, so the document
+    // must say whom it is for (checked above when present — required here).
+    if body.get("recipient").and_then(Value::as_str).is_none() {
+        return Err(RejectReason::MalformedRequest {
+            reason: "a document authenticated by its proof must name its recipient".into(),
+        });
+    }
     if let Some(from) = envelope_from {
         let from_did = from.split('#').next().unwrap_or(from);
         if from_did != issuer {
@@ -95,6 +113,72 @@ pub async fn authenticate(
         }
     }
     Ok(Some(issuer))
+}
+
+/// The acceptance window for an authenticated document's time of issue
+/// (VTI-OPS-024): `issuedAt` is required, may be at most
+/// [`trust_tasks_rs::DEFAULT_MAX_AGE`] (5 min) old and no more than
+/// [`trust_tasks_rs::DEFAULT_SKEW`] (60 s) in the future. The replay record
+/// is kept for exactly this window, so the two cannot drift apart.
+pub fn acceptance_window() -> FreshnessPolicy {
+    FreshnessPolicy::consequential()
+}
+
+/// Admit an authenticated document once (VTI-OPS-024 / VTI-OPS-026).
+///
+/// `Ok(Some(response))` is a duplicate delivery of a document already
+/// executed, answered with what the first execution returned — it is not run
+/// again. `Ok(None)` means the document is fresh and has been claimed.
+async fn admit_once(
+    state: &AppState,
+    doc: &TrustTask<Value>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<Value>, RejectReason> {
+    let policy = acceptance_window();
+    doc.validate_freshness(now, &policy)?;
+    if doc.id.is_empty() {
+        return Err(RejectReason::MalformedRequest {
+            reason: "document carries no identifier".into(),
+        });
+    }
+    let digest = document_digest(doc).map_err(|_| RejectReason::MalformedRequest {
+        reason: "document cannot be canonicalised".into(),
+    })?;
+    // Retained until the document leaves the window — a producer-supplied
+    // `expiresAt` cannot stretch it (`issuedAt` is required by the policy).
+    let window_end = doc
+        .issued_at
+        .zip(policy.max_age)
+        .map(|(issued, age)| issued + age + policy.skew);
+    let retain_until = match (policy.record_expiry(doc, now), window_end) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    match state
+        .replay
+        .claim(&doc.id, &digest, retain_until, now)
+        .await
+    {
+        Ok(ReplayVerdict::Fresh) => Ok(None),
+        Ok(ReplayVerdict::Duplicate {
+            prior_response: Some(prior),
+            ..
+        }) => Ok(Some(prior)),
+        Ok(ReplayVerdict::Duplicate { .. }) => Err(RejectReason::TaskFailed {
+            reason: "this document has already been accepted".into(),
+            details: None,
+        }),
+        Ok(ReplayVerdict::Conflict) => Err(RejectReason::IdConflict),
+        Ok(_) => Err(RejectReason::IdConflict),
+        // Fail closed: without the record a duplicate cannot be ruled out.
+        Err(e) => {
+            tracing::error!(error = %e, "replay record unavailable; refusing");
+            Err(RejectReason::TaskFailed {
+                reason: "replay record unavailable; retry later".into(),
+                details: None,
+            })
+        }
+    }
 }
 
 /// Handle one Trust Task envelope body: authenticate it, dispatch it, and return
@@ -112,13 +196,34 @@ pub async fn handle_envelope(
             return None;
         }
     };
-    match authenticate(&state.proofs, &state.gateway_did, envelope_from, body).await {
-        Ok(sender) => Some(dispatch_push(&state.app, sender, &doc).await),
-        Err(reason) => {
-            tracing::warn!(from = ?envelope_from, %reason, "refusing push/* document");
-            Some(reject_value(&doc, reason))
-        }
+    let refuse = |reason: RejectReason| {
+        tracing::warn!(from = ?envelope_from, %reason, "refusing push/* document");
+        Some(reject_value(&doc, reason))
+    };
+    let sender = match authenticate(&state.proofs, &state.gateway_did, envelope_from, body).await {
+        Ok(sender) => sender,
+        Err(reason) => return refuse(reason),
+    };
+    if sender.is_none() {
+        // Anonymous: only `push/register` can succeed, and it is idempotent in
+        // effect (a fresh opaque handle, bounded by the registry caps).
+        return Some(dispatch_push(&state.app, None, &doc).await);
     }
+    match admit_once(&state.app, &doc, chrono::Utc::now()).await {
+        Ok(None) => {}
+        Ok(Some(prior)) => return Some(prior),
+        Err(reason) => return refuse(reason),
+    }
+    let response = dispatch_push(&state.app, sender, &doc).await;
+    if let Err(e) = state
+        .app
+        .replay
+        .record_response(&doc.id, Some(&response))
+        .await
+    {
+        tracing::warn!(error = %e, "could not record the response for duplicate delivery");
+    }
+    Some(response)
 }
 
 /// Handler for every `push/*` type. The inner Trust Task doc rides in

@@ -109,14 +109,25 @@ the device's VTA provisions a trigger). Replay is harmless by design (a
 duplicate wake is an idempotent doorbell), so no nonce is required — see
 binding §6.
 
-Over the **DIDComm** transport the caller signs the Trust Task document itself:
-an `eddsa-jcs-2022` Data Integrity proof with `proofPurpose: assertionMethod`.
-The caller is the document's `issuer`, and only when:
+Over the **DIDComm** transport the caller signs the Trust Task document itself
+with its **operational** key: an `eddsa-jcs-2022` Data Integrity proof with
+`proofPurpose: authentication` (VTI-KEY-106 — these are the caller's own
+messages, not attestations, so an `assertionMethod` proof is refused). The
+caller is the document's `issuer`, and only when:
 
 - the DID of `proof.verificationMethod` is the `issuer`;
 - the issuer's DID document lists that method, with `controller` equal to the
-  issuer, under `assertionMethod`;
+  issuer, under `authentication`;
 - the signature verifies over the document without its `proof`.
+
+An `authentication` proof carries no challenge, so the document binds it to one
+delivery (VTI-KEY-107): it must name this gateway as `recipient`, carry an
+`issuedAt` no more than 5 minutes old and no more than 60 s in the future
+(VTI-OPS-024; `expired` / `malformedRequest` otherwise), and an `id` not already
+accepted within that window (VTI-OPS-026). A second delivery of an accepted
+document is answered with the first response and not executed again; a
+different document under an accepted `id` gets `idConflict`. The record is in
+memory and per process.
 
 `push/provision` then requires that issuer to be the handle's
 `controllerVtaDid`; `push/wake` requires it to be on the allowlist. The DIDComm

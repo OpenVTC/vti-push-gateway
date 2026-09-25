@@ -33,7 +33,7 @@ use axum::{
 use rand::Rng;
 use serde::Serialize;
 use serde_json::{json, Value};
-use trust_tasks_rs::{RejectReason, TrustTask};
+use trust_tasks_rs::{InMemoryReplayGuard, RejectReason, TrustTask};
 use uuid::Uuid;
 
 use crate::auth::{self, HEADER_DID, HEADER_SIG};
@@ -80,6 +80,11 @@ pub struct AppState {
     /// Per-operation rate limits. Consulted in [`dispatch_push`] rather than in
     /// HTTP middleware, so the DIDComm transport is covered too.
     pub limits: Arc<Limits>,
+    /// The record of accepted document identifiers (VTI-OPS-026). One per
+    /// process and shared by every binding that consults it (VTI-OPS-027); it
+    /// is in memory, so a restart forgets it — which the acceptance window
+    /// makes safe, since anything it forgot is by then too old to accept.
+    pub replay: Arc<InMemoryReplayGuard>,
 }
 
 /// The **public** router: the `push/*` Trust-Task endpoint and a liveness probe.

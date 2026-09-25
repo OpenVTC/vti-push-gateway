@@ -50,12 +50,17 @@ impl Party {
         Self { did, secret }
     }
 
-    /// Sign `doc` as this party, attaching an `eddsa-jcs-2022` proof.
+    /// Sign `doc` as this party with its operational key, the way a service
+    /// signs its own messages: `eddsa-jcs-2022`, `proofPurpose: authentication`.
     async fn sign(&self, mut doc: Value) -> Value {
         doc.as_object_mut().unwrap().remove("proof");
-        let proof = DataIntegrityProof::sign(&doc, &self.secret, SignOptions::new())
-            .await
-            .expect("signs");
+        let proof = DataIntegrityProof::sign(
+            &doc,
+            &self.secret,
+            SignOptions::new().with_proof_purpose("authentication"),
+        )
+        .await
+        .expect("signs");
         doc["proof"] = serde_json::to_value(&proof).unwrap();
         doc
     }
@@ -70,6 +75,7 @@ async fn didcomm_state() -> DidcommState {
         metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
         egress: Arc::new(EgressPolicy::default()),
         limits: Arc::new(Limits::permissive()),
+        replay: Arc::new(trust_tasks_rs::InMemoryReplayGuard::default()),
     };
     let client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
         .await
@@ -85,7 +91,7 @@ fn doc(type_uri: &str, issuer: Option<&str>, payload: Value) -> Value {
     let mut d = json!({
         "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
         "type": type_uri,
-        "issuedAt": "2026-09-25T00:00:00Z",
+        "issuedAt": chrono::Utc::now().to_rfc3339(),
         "recipient": GATEWAY_DID,
         "payload": payload,
     });
@@ -276,9 +282,10 @@ async fn document_for_another_recipient_is_refused() {
     assert_eq!(error_code(&resp), "wrongRecipient", "{resp}");
 }
 
-/// A proof with the wrong purpose is refused even though it verifies.
+/// An `assertionMethod` proof is an attestation, not a message signature: it is
+/// refused even though it verifies (VTI-KEY-106).
 #[tokio::test]
-async fn authentication_purpose_proof_is_refused() {
+async fn assertion_method_proof_is_refused() {
     let st = didcomm_state().await;
     let vta = Party::new();
     let handle = register(&st, &vta.did).await;
@@ -287,11 +294,93 @@ async fn authentication_purpose_proof_is_refused() {
     let proof = DataIntegrityProof::sign(
         &prov,
         &vta.secret,
-        SignOptions::new().with_proof_purpose("authentication"),
+        SignOptions::new().with_proof_purpose("assertionMethod"),
     )
     .await
     .unwrap();
     prov["proof"] = serde_json::to_value(&proof).unwrap();
     let resp = send(&st, Some(&vta.did), &prov).await;
     assert_eq!(error_code(&resp), "proofInvalid", "{resp}");
+}
+
+/// Without a challenge, the recipient is part of what binds the proof, so a
+/// signed document must name one (VTI-KEY-107).
+#[tokio::test]
+async fn signed_document_without_a_recipient_is_refused() {
+    let st = didcomm_state().await;
+    let vta = Party::new();
+    let handle = register(&st, &vta.did).await;
+    let mut prov = provision_doc(&vta.did, &handle, &vta.did);
+    prov.as_object_mut().unwrap().remove("recipient");
+    let resp = send(&st, Some(&vta.did), &vta.sign(prov).await).await;
+    assert_eq!(error_code(&resp), "malformedRequest", "{resp}");
+}
+
+/// The time of issue is required and must be inside the acceptance window
+/// (VTI-OPS-024).
+#[tokio::test]
+async fn time_of_issue_outside_the_window_is_refused() {
+    let st = didcomm_state().await;
+    let vta = Party::new();
+    let handle = register(&st, &vta.did).await;
+    let now = chrono::Utc::now();
+
+    let mut stale = provision_doc(&vta.did, &handle, &vta.did);
+    stale["issuedAt"] = json!((now - chrono::TimeDelta::minutes(10)).to_rfc3339());
+    let resp = send(&st, Some(&vta.did), &vta.sign(stale).await).await;
+    assert_eq!(error_code(&resp), "expired", "{resp}");
+
+    let mut future = provision_doc(&vta.did, &handle, &vta.did);
+    future["issuedAt"] = json!((now + chrono::TimeDelta::minutes(10)).to_rfc3339());
+    let resp = send(&st, Some(&vta.did), &vta.sign(future).await).await;
+    assert_eq!(error_code(&resp), "malformedRequest", "{resp}");
+
+    let mut missing = provision_doc(&vta.did, &handle, &vta.did);
+    missing.as_object_mut().unwrap().remove("issuedAt");
+    let resp = send(&st, Some(&vta.did), &vta.sign(missing).await).await;
+    assert_eq!(error_code(&resp), "malformedRequest", "{resp}");
+}
+
+/// A captured signed wake delivered again is not executed again: it is answered
+/// with the first response and no second push goes out (VTI-OPS-026).
+#[tokio::test]
+async fn replayed_document_is_not_executed_twice() {
+    let st = didcomm_state().await;
+    let vta = Party::new();
+    let handle = register(&st, &vta.did).await;
+    let prov = vta.sign(provision_doc(&vta.did, &handle, &vta.did)).await;
+    assert!(is_success(&send(&st, Some(&vta.did), &prov).await));
+
+    let wake = vta.sign(wake_doc(&vta.did, &handle)).await;
+    let first = send(&st, Some(&vta.did), &wake).await;
+    assert!(is_success(&first), "{first}");
+    let delivered = st.app.metrics.render();
+    let again = send(&st, Some(&vta.did), &wake).await;
+    assert_eq!(
+        again, first,
+        "a duplicate is answered with the first response"
+    );
+    assert_eq!(
+        st.app.metrics.render(),
+        delivered,
+        "and nothing is sent again"
+    );
+}
+
+/// A different document reusing an accepted identifier is refused.
+#[tokio::test]
+async fn reused_identifier_is_refused() {
+    let st = didcomm_state().await;
+    let vta = Party::new();
+    let handle = register(&st, &vta.did).await;
+    let first = provision_doc(&vta.did, &handle, &vta.did);
+    let id = first["id"].clone();
+    assert!(is_success(
+        &send(&st, Some(&vta.did), &vta.sign(first).await).await
+    ));
+
+    let mut second = provision_doc(&vta.did, &handle, &Party::new().did);
+    second["id"] = id;
+    let resp = send(&st, Some(&vta.did), &vta.sign(second).await).await;
+    assert_eq!(error_code(&resp), "idConflict", "{resp}");
 }

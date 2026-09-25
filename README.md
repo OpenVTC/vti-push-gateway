@@ -134,11 +134,17 @@ gets `idConflict`; a transient push failure is not remembered, so a retry is
 attempted. A provision that re-applies the stored allowlist changes nothing and
 spends no record. The record is in memory and per process.
 
-**Who can spend the record.** `push/register` is anonymous and names its
-`controllerVtaDid` freely, so anyone can make a DID they hold the controller of
-a handle and then send it correctly signed provisions. A proof from the
-controller at registration would not change that — the attacker *is* that
-controller — so the gateway does not pretend otherwise. What it guarantees:
+**Which controllers are served.** `push/register` is anonymous and names its
+`controllerVtaDid`, so without a list anyone could make a DID they hold the
+controller of a handle and send it correctly signed provisions — a proof from
+the controller at registration would not stop that, since the attacker *is*
+that controller. So the operator **lists the VTAs the gateway serves** in
+`GATEWAY_ALLOWED_CONTROLLERS`: a registration naming any other controller is
+refused (`permissionDenied`), and so is a provision by a controller no longer on
+the list. Unset means nothing is served. `*` is an explicit open mode for
+deliberate use; it logs a startup warning and keeps every bound below.
+
+**Who can spend the record.** Within the served controllers:
 
 - a handle's controller spends record only by a signed, authorised provision
   that changes the allowlist; an unprovisioned handle holds nothing and is
@@ -217,6 +223,13 @@ cargo run
 # GATEWAY_METRICS_TOKEN=<secret>   require `Authorization: Bearer <secret>` on
 #                       the management listener. Unset = no auth (fine on
 #                       loopback).
+# GATEWAY_ALLOWED_CONTROLLERS="did:webvh:…:vta-a did:webvh:…:vta-b"
+#                       REQUIRED in practice: the controller VTA DIDs this
+#                       gateway serves (comma/space separated, exact match, no
+#                       patterns). Unset/empty = every push/register is refused
+#                       (logged at startup). `*` alone = open mode (any
+#                       controller; startup warning; all other limits apply).
+#                       A malformed list stops startup.
 # Registry bounds (push/register is anonymous, so these cap what an
 # unauthenticated caller can make the gateway hold; all optional):
 # GATEWAY_MAX_HANDLES_PER_CONTROLLER=4096   live handles naming one
@@ -294,7 +307,9 @@ The wake loop spans the gateway, a VTA + mediator, and the browser plugin. A
    so you can recover it any time):
 
    ```sh
-   GATEWAY_VAPID_KEY_FILE=./vapid.pem RUST_LOG=vti_push_gateway=info cargo run
+   GATEWAY_VAPID_KEY_FILE=./vapid.pem \
+   GATEWAY_ALLOWED_CONTROLLERS="<your VTA's DID>" \
+   RUST_LOG=vti_push_gateway=info cargo run
    #  WARN … vapid_public="BOae…"  Web Push (VAPID) sender enabled — set this as
    #        the device/plugin applicationServerKey
    ```
@@ -327,7 +342,9 @@ Prove a contentless push reaches the browser and wakes the service worker.
 2. Fire a real, did-signed wake at it with the bundled helper — it mints a
    throwaway `did:key`, registers the subscription, provisions itself onto the
    allowlist, and sends `push/wake`, so the gateway runs its normal auth +
-   delivery (no VTA, no hand-signing):
+   delivery (no VTA, no hand-signing). Because it registers under a throwaway
+   controller, the local gateway it targets must run in open mode
+   (`GATEWAY_ALLOWED_CONTROLLERS=*`) — a dev-only setting:
 
    ```sh
    cargo run -- test-wake http://127.0.0.1:8300 ./sub.json

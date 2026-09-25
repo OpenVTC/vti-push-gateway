@@ -14,6 +14,7 @@ use rand::Rng;
 use serde_json::{json, Value};
 
 use vti_push_gateway::api::AppState;
+use vti_push_gateway::controllers::ControllerPolicy;
 use vti_push_gateway::didcomm::{handle_envelope, DidcommState};
 use vti_push_gateway::egress::EgressPolicy;
 use vti_push_gateway::limits::Limits;
@@ -76,6 +77,9 @@ async fn didcomm_state() -> DidcommState {
         egress: Arc::new(EgressPolicy::default()),
         limits: Arc::new(Limits::permissive()),
         replay: Arc::new(vti_push_gateway::replay::ReplayRecord::default()),
+        // These suites mint a fresh controller per test; the allowlist has
+        // its own tests.
+        controllers: Arc::new(vti_push_gateway::controllers::ControllerPolicy::Open),
     };
     let client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
         .await
@@ -699,4 +703,102 @@ async fn one_handle_cannot_spend_more_than_its_budget() {
     )
     .await;
     assert!(is_success(&r), "{r}");
+}
+
+// ── The controller allowlist ────────────────────────────────────────────
+
+fn with_controllers(st: DidcommState, policy: ControllerPolicy) -> DidcommState {
+    let mut app = st.app.clone();
+    app.controllers = Arc::new(policy);
+    DidcommState { app, ..st }
+}
+
+fn register_doc(controller: &str, n: usize) -> Value {
+    doc(
+        PUSH_REGISTER,
+        None,
+        json!({
+            "registration": { "platform": "apns", "token": format!("{n:064x}"), "topic": "org.openvtc.app" },
+            "controllerVtaDid": controller,
+        }),
+    )
+}
+
+/// The default — nothing listed — refuses every registration.
+#[tokio::test]
+async fn by_default_no_controller_is_served() {
+    let st = with_controllers(didcomm_state().await, ControllerPolicy::default());
+    let resp = send(&st, None, &register_doc(&Party::new().did, 1)).await;
+    assert_eq!(error_code(&resp), "permissionDenied", "{resp}");
+}
+
+/// A registration naming an unlisted controller is refused; a listed one is
+/// accepted and its handle provisions and wakes as usual.
+#[tokio::test]
+async fn only_listed_controllers_may_register() {
+    let vta = Party::new();
+    let trigger = Party::new();
+    let st = with_controllers(
+        didcomm_state().await,
+        ControllerPolicy::listing([vta.did.clone()]),
+    );
+
+    let resp = send(&st, None, &register_doc(&Party::new().did, 1)).await;
+    assert_eq!(error_code(&resp), "permissionDenied", "{resp}");
+    assert_eq!(st.app.store.len(), 0, "nothing was stored");
+
+    let handle = provisioned(&st, &vta, &[&trigger.did]).await;
+    let resp = send(
+        &st,
+        None,
+        &trigger.sign(wake_doc(&trigger.did, &handle)).await,
+    )
+    .await;
+    assert!(is_success(&resp), "{resp}");
+}
+
+/// A controller dropped from the list can no longer provision a handle it
+/// registered earlier (e.g. one restored from a snapshot).
+#[tokio::test]
+async fn a_delisted_controller_cannot_provision() {
+    let vta = Party::new();
+    let st = didcomm_state().await; // open, to register the handle
+    let handle = register(&st, &vta.did).await;
+    let st = with_controllers(st, ControllerPolicy::default());
+    let prov = vta.sign(provision_doc(&vta.did, &handle, &vta.did)).await;
+    let resp = send(&st, None, &prov).await;
+    assert_eq!(error_code(&resp), "permissionDenied", "{resp}");
+    assert_eq!(st.app.replay.len_for(&vta.did), 0, "and spends no record");
+}
+
+/// Open mode admits any controller, and every other bound still holds.
+#[tokio::test]
+async fn open_mode_keeps_the_limits() {
+    let mut st = with_controllers(didcomm_state().await, ControllerPolicy::Open);
+    st.app.store = Arc::new(Store::with_limits(vti_push_gateway::store::StoreLimits {
+        max_per_controller: 2,
+        ..Default::default()
+    }));
+    let a = Party::new();
+    for n in 0..2 {
+        assert!(is_success(&send(&st, None, &register_doc(&a.did, n)).await));
+    }
+    let resp = send(&st, None, &register_doc(&a.did, 2)).await;
+    assert!(
+        !is_success(&resp),
+        "the per-controller cap still applies: {resp}"
+    );
+
+    let st = with_record(
+        st,
+        vti_push_gateway::replay::ReplayRecord::with_per_handle(8192, 1, 65_536),
+    );
+    let b = Party::new();
+    let handle = provisioned(&st, &b, &[&b.did]).await; // spends the handle's one record
+    let resp = send(&st, None, &b.sign(wake_doc(&b.did, &handle)).await).await;
+    assert_eq!(
+        error_code(&resp),
+        "taskFailed",
+        "the per-handle budget still applies: {resp}"
+    );
 }

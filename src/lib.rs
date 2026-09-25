@@ -4,6 +4,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod controllers;
 pub mod didcomm;
 pub mod egress;
 pub mod identity;

@@ -37,6 +37,7 @@ use trust_tasks_rs::{RejectReason, TrustTask};
 use uuid::Uuid;
 
 use crate::auth::{self, HEADER_DID, HEADER_SIG};
+use crate::controllers::ControllerPolicy;
 use crate::egress::EgressPolicy;
 use crate::limits::Limits;
 use crate::metrics::Metrics;
@@ -85,6 +86,8 @@ pub struct AppState {
     /// (issuer, id). One per process and shared by every binding that consults
     /// it (VTI-OPS-027). See [`crate::replay`].
     pub replay: Arc<ReplayRecord>,
+    /// Which controller VTAs this gateway serves ([`crate::controllers`]).
+    pub controllers: Arc<ControllerPolicy>,
 }
 
 /// The **public** router: the `push/*` Trust-Task endpoint and a liveness probe.
@@ -351,6 +354,17 @@ async fn handle_register(state: &AppState, doc: &TrustTask<Value>) -> Value {
     if let Err(reason) = req.validate(&state.egress) {
         return malformed(doc, reason);
     }
+    // Only a controller this gateway serves may be named (checked before a
+    // sender is selected or anything is stored).
+    if !state.controllers.allows(&req.controller_vta_did) {
+        tracing::warn!("refusing registration naming a controller this gateway does not serve");
+        return reject_value(
+            doc,
+            RejectReason::PermissionDenied {
+                reason: "controller VTA is not served by this gateway".into(),
+            },
+        );
+    }
     if sender::select(&state.senders, &req.registration).is_none() {
         return reject_value(
             doc,
@@ -403,6 +417,17 @@ async fn handle_provision(
         return malformed(doc, reason);
     }
     let triggers = req.policy.allowed_triggers.clone();
+    // A controller this gateway no longer serves (the list narrowed since the
+    // handle was registered) cannot provision it.
+    if !state.controllers.allows(&caller) {
+        state.metrics.inc_provision_not_controller();
+        return reject_value(
+            doc,
+            RejectReason::PermissionDenied {
+                reason: "controller VTA is not served by this gateway".into(),
+            },
+        );
+    }
     // Authorise before admitting: a caller that is not the controller (or names
     // no handle) is refused without touching the replay record.
     match state.store.check_controller(&req.handle, &caller) {

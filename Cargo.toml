@@ -38,6 +38,10 @@ uuid = { version = "1", features = ["v4"] }
 affinidi-messaging-didcomm-service = "0.11"
 affinidi-tdk = "0.16"
 affinidi-secrets-resolver = "0.5"
+# Data Integrity (`eddsa-jcs-2022`) verification of the proof a `push/provision`
+# or `push/wake` document carries on the DIDComm path — the caller is the
+# document issuer that proof establishes, not the envelope sender (src/proof.rs).
+affinidi-data-integrity = "0.7.13"
 # 0.8.37 is a floor, not cosmetic: it is the first release whose did:web **and**
 # did:webvh resolvers refuse non-public hosts by default (didwebvh-rs 0.7's
 # `HostPolicy`). A DID names the host its document is fetched from, and the

@@ -9,8 +9,9 @@
 //! `TrustTask` and returns the response **document** (a `…#response` or a
 //! `trust-task-error`). Each transport adapter authenticates/unpacks, calls the
 //! core, and delivers the document in its own idiom — `POST /trust-tasks`
-//! (HTTPS, did-signed) here; the DIDComm adapter (added next, the *preferred*
-//! transport) will call the same core with the authcrypt sender. The core is a
+//! (HTTPS, did-signed) here; the DIDComm adapter (the *preferred* transport)
+//! calls the same core with the issuer the document's Data Integrity proof
+//! establishes — never with the envelope's `from` alone. The core is a
 //! function, not a worker task: request/response transports just `await`/call
 //! it (see the architecture note — no dedicated worker, which would bottleneck).
 
@@ -181,7 +182,7 @@ fn success_value<R: Serialize>(doc: &TrustTask<Value>, payload: R) -> Value {
 }
 
 /// Serialize a `trust-task-error` document for this request.
-fn reject_value(doc: &TrustTask<Value>, reason: RejectReason) -> Value {
+pub(crate) fn reject_value(doc: &TrustTask<Value>, reason: RejectReason) -> Value {
     serde_json::to_value(doc.reject_with(new_id(), reason)).unwrap_or(Value::Null)
 }
 
@@ -226,6 +227,10 @@ fn parse<T: serde::de::DeserializeOwned>(doc: &TrustTask<Value>) -> Result<T, Va
 /// Perform a `push/*` operation and return the response document. `sender` is
 /// the authenticated caller DID (`None` if the transport authenticated no one —
 /// allowed for `push/register`). Shared by every transport adapter.
+///
+/// "Authenticated" means proven by a signature the adapter verified — the HTTPS
+/// body signature, or the document's Data Integrity proof on DIDComm. A
+/// transport's own claim about its sender is not enough to pass here.
 pub(crate) async fn dispatch_push(
     state: &AppState,
     sender: Option<String>,

@@ -47,7 +47,9 @@ restart).
 **DIDComm transport (preferred)** is wired: when `GATEWAY_IDENTITY_FILE`
 provides the gateway's provisioned `did:webvh` identity, a `DIDCommService`
 (`affinidi-messaging-didcomm-service`) connects to the mediator and dispatches
-inbound `push/*` to the same core — the crate does the unpack + sender-auth.
+inbound `push/*` to the same core — the crate does the unpack, and the gateway
+authenticates `push/provision` / `push/wake` by the Data Integrity proof on the
+Trust Task document (see "Authentication" below).
 Identity is provisioned like any integration: `pnm bootstrap
 provision-integration --template push-gateway --var URL=<gateway-didcomm-url>`,
 then open the bundle into the identity file.
@@ -93,20 +95,35 @@ On the **management** listener (`GATEWAY_METRICS_BIND`, default
 Success returns a `…#response` Trust Task document; failure returns a
 `trust-task-error/0.1` document (the envelope carries the outcome).
 
-### Authentication over HTTPS (`provision`, `wake`)
+### Authentication (`provision`, `wake`)
 
-The caller signs the **raw request body bytes** (the Trust Task document) with
-its `did:key` Ed25519 key:
+Over **HTTPS** the caller signs the **raw request body bytes** (the Trust Task
+document) with its `did:key` Ed25519 key:
 
 - `X-TT-Did: did:key:z…` — the caller's did:key (Ed25519).
 - `X-TT-Signature: <base64url>` — Ed25519 signature over the exact body bytes.
 
 The gateway resolves the did:key offline (multicodec/base58btc — no network) and
 verifies. `register` is unauthenticated (the handle is opaque and useless until
-the device's VTA provisions a trigger). Over the **DIDComm** transport (next),
-the authcrypt sender authenticates the caller intrinsically — no signature
-header. Replay is harmless by design (a duplicate wake is an idempotent
-doorbell), so no nonce is required — see binding §6.
+the device's VTA provisions a trigger). Replay is harmless by design (a
+duplicate wake is an idempotent doorbell), so no nonce is required — see
+binding §6.
+
+Over the **DIDComm** transport the caller signs the Trust Task document itself:
+an `eddsa-jcs-2022` Data Integrity proof with `proofPurpose: assertionMethod`.
+The caller is the document's `issuer`, and only when:
+
+- the DID of `proof.verificationMethod` is the `issuer`;
+- the issuer's DID document lists that method, with `controller` equal to the
+  issuer, under `assertionMethod`;
+- the signature verifies over the document without its `proof`.
+
+`push/provision` then requires that issuer to be the handle's
+`controllerVtaDid`; `push/wake` requires it to be on the allowlist. The DIDComm
+envelope sender is never an authorising identity on its own: a document without
+a proof is anonymous (`push/register` only; provision/wake get `proofRequired`),
+an envelope sender that differs from the proven issuer gets `identityMismatch`,
+and a document whose `recipient` is not this gateway gets `wrongRecipient`.
 
 ### Example (HTTPS)
 

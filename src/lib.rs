@@ -9,6 +9,7 @@ pub mod egress;
 pub mod identity;
 pub mod limits;
 pub mod metrics;
+pub mod proof;
 pub mod resolver;
 pub mod secretfile;
 pub mod sender;

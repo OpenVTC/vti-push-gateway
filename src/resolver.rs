@@ -99,7 +99,8 @@ impl ResolverTuning {
         }
     }
 
-    fn did_cache_config(&self) -> DIDCacheConfig {
+    /// The DID-cache configuration this tuning describes.
+    pub fn did_cache_config(&self) -> DIDCacheConfig {
         let mut builder = DIDCacheConfigBuilder::default()
             .with_cache_capacity(self.cache_capacity)
             .with_cache_ttl(self.cache_ttl_secs)

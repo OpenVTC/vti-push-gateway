@@ -1,5 +1,5 @@
-//! Document-level authentication for `push/provision` and `push/wake` arriving
-//! over DIDComm: an `eddsa-jcs-2022` Data Integrity proof on the Trust Task
+//! Document-level authentication for `push/provision` and `push/wake`, on
+//! every transport: an `eddsa-jcs-2022` Data Integrity proof on the Trust Task
 //! document, bound to the document's `issuer`.
 //!
 //! These are a service's own operational messages, not attestations, so the
@@ -8,20 +8,21 @@
 //! for attestation artefacts and is refused here. An `authentication` proof
 //! carries no challenge, so what binds it to one delivery is the document's
 //! recipient, time of issue and identifier — checked by the caller
-//! (`didcomm::authenticate`, VTI-KEY-107).
+//! ([`crate::intake`], VTI-KEY-107).
 //!
-//! The HTTPS adapter authenticates a caller by a signature over the request
-//! body (`auth.rs`). The DIDComm adapter now asks for the equivalent, carried
-//! in-band: the controller VTA (or trigger) signs the Trust Task document, and
-//! the gateway authorises on the DID that proof establishes. The DIDComm
-//! envelope's `from` is **not** an authorising identity on its own — a message
-//! whose only claim to a sender is the envelope gets `proofRequired`.
+//! The proof travels in the document, so it authenticates the same way
+//! whichever transport carried it: the controller VTA (or trigger) signs the
+//! Trust Task document, and the gateway authorises on the DID that proof
+//! establishes. No transport's own claim about its sender — a DIDComm
+//! envelope's `from`, an HTTP header — is an authorising identity; a document
+//! whose only claim to a sender is its transport gets `proofRequired`.
 //!
 //! [`ProofVerifier::verify_issuer`] returns the proven issuer DID after checking,
 //! in order:
 //!
 //! 1. the document carries a string `issuer` and a `proof`;
-//! 2. the proof is `eddsa-jcs-2022` with `proofPurpose: authentication`;
+//! 2. the proof is `eddsa-jcs-2022` with `proofPurpose: authentication`
+//!    (parsed as a [`ProofPurpose`]; any other purpose is refused);
 //! 3. the DID part of `proof.verificationMethod` **is** the `issuer` (exact
 //!    string equality, no normalisation);
 //! 4. the issuer's DID document lists that verification method, the method's
@@ -30,6 +31,10 @@
 //!    agreement or for attestations does not authenticate its messages;
 //! 5. the signature verifies over the document with `proof` removed, against
 //!    the key from step 4.
+//!
+//! Steps 4 and 5 run through trust-tasks-proof's [`PurposeBound`]: the
+//! gateway's [`IssuerKeys`] is a [`ProofPurposeResolver`], so the key is only
+//! released for the relationship the proof declares.
 //!
 //! Verification runs over the raw JSON body, not a typed round-trip, so it is
 //! faithful to what the issuer signed, unknown members included.
@@ -41,19 +46,16 @@
 use std::sync::Arc;
 
 use affinidi_data_integrity::crypto_suites::CryptoSuite;
-use affinidi_data_integrity::{
-    DataIntegrityError, DataIntegrityProof, ResolvedKey, VerificationMethodResolver, VerifyOptions,
-};
+use affinidi_data_integrity::{DataIntegrityError, DataIntegrityProof, ResolvedKey, VerifyOptions};
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_secrets_resolver::secrets::KeyType;
 use async_trait::async_trait;
 use serde_json::Value;
+use trust_tasks_proof::affinidi::{ProofPurpose, ProofPurposeResolver, PurposeBound};
 
-/// The only proof purpose accepted on a `push/*` document.
-pub const PROOF_PURPOSE: &str = "authentication";
-
-/// The DID-document verification relationship the proof's method must be in.
-const RELATIONSHIP: &str = "authentication";
+/// The only proof purpose accepted on a `push/*` document: these are the
+/// issuer's own operational messages, not attestations.
+pub const PROOF_PURPOSE: ProofPurpose = ProofPurpose::Authentication;
 
 /// Ed25519 public-key multicodec prefix (`0xed 0x01`).
 const ED25519_MULTICODEC: [u8; 2] = [0xed, 0x01];
@@ -77,15 +79,17 @@ fn invalid(reason: impl Into<String>) -> ProofError {
 /// them. Cheap to clone; share one per process.
 #[derive(Clone)]
 pub struct ProofVerifier {
-    client: Arc<DIDCacheClient>,
+    keys: IssuerKeys,
 }
 
 impl ProofVerifier {
-    /// Wrap a configured DID resolver. It should be built with the same host
-    /// policy as the DIDComm listener's (see [`crate::resolver`]), since the
-    /// DIDs it resolves are chosen by whoever sends the gateway a message.
+    /// Wrap a configured DID resolver. It should be built with the gateway's
+    /// host policy (see [`crate::resolver`]), since the DIDs it resolves are
+    /// chosen by whoever sends the gateway a document.
     pub fn new(client: Arc<DIDCacheClient>) -> Self {
-        Self { client }
+        Self {
+            keys: IssuerKeys { client },
+        }
     }
 
     /// Whether `raw` carries a `proof` member.
@@ -111,8 +115,9 @@ impl ProofVerifier {
         if proof.cryptosuite != CryptoSuite::EddsaJcs2022 {
             return Err(invalid("proof cryptosuite must be eddsa-jcs-2022"));
         }
-        if proof.proof_purpose != PROOF_PURPOSE {
-            return Err(invalid("proof purpose must be authentication"));
+        match ProofPurpose::parse(&proof.proof_purpose) {
+            Ok(PROOF_PURPOSE) => {}
+            _ => return Err(invalid("proof purpose must be authentication")),
         }
 
         let vm = proof.verification_method.as_str();
@@ -125,8 +130,6 @@ impl ProofVerifier {
             ));
         }
 
-        let key = self.authentication_key(issuer, vm).await?;
-
         let mut unsigned = raw.clone();
         if let Some(obj) = unsigned.as_object_mut() {
             obj.remove("proof");
@@ -134,29 +137,50 @@ impl ProofVerifier {
         proof
             .verify(
                 &unsigned,
-                &PinnedKey(key),
+                &PurposeBound::new(&self.keys, PROOF_PURPOSE),
                 VerifyOptions::new().with_allowed_suites(vec![CryptoSuite::EddsaJcs2022]),
             )
             .await
             .map_err(|e| {
                 tracing::debug!(error = %e, issuer, "push/* proof failed to verify");
-                invalid("proof signature does not verify")
+                match e {
+                    // The key lookup's own reason says what was wrong with the
+                    // issuer's key; anything else is the signature.
+                    DataIntegrityError::Resolver(reason) => ProofError::Invalid(reason),
+                    _ => invalid("proof signature does not verify"),
+                }
             })?;
         Ok(issuer.to_string())
     }
+}
 
-    /// Resolve `issuer` and return the Ed25519 key of verification method `vm`,
-    /// provided the document lists it, it is controlled by `issuer`, and it is
-    /// an `authentication` method of `issuer`.
-    async fn authentication_key(&self, issuer: &str, vm: &str) -> Result<ResolvedKey, ProofError> {
-        let resolved = self.client.resolve(issuer).await.map_err(|e| {
-            tracing::debug!(error = %e, issuer, "could not resolve the proof issuer");
-            invalid("could not resolve the proof issuer's DID document")
+/// The gateway's [`ProofPurposeResolver`]: releases a verification method's
+/// key only when the issuer's DID document authorises it for the proof's
+/// purpose, and only while the method is neither revoked nor expired.
+#[derive(Clone)]
+pub struct IssuerKeys {
+    client: Arc<DIDCacheClient>,
+}
+
+#[async_trait]
+impl ProofPurposeResolver for IssuerKeys {
+    async fn resolve_vm_for_purpose(
+        &self,
+        vm: &str,
+        purpose: ProofPurpose,
+    ) -> Result<ResolvedKey, DataIntegrityError> {
+        let refuse = |e: ProofError| DataIntegrityError::Resolver(e.to_string());
+        let (did, _) = vm
+            .split_once('#')
+            .ok_or_else(|| refuse(invalid("verificationMethod is not a DID URL")))?;
+        let resolved = self.client.resolve(did).await.map_err(|e| {
+            tracing::debug!(error = %e, did, "could not resolve the proof issuer");
+            refuse(invalid("could not resolve the proof issuer's DID document"))
         })?;
         let doc = serde_json::to_value(&resolved.doc)
-            .map_err(|_| invalid("issuer DID document did not serialise"))?;
-        check_document_size(&doc)?;
-        authentication_key_in(&doc, issuer, vm, chrono::Utc::now())
+            .map_err(|_| refuse(invalid("issuer DID document did not serialise")))?;
+        check_document_size(&doc).map_err(refuse)?;
+        key_for_purpose_in(&doc, did, vm, purpose, chrono::Utc::now()).map_err(refuse)
     }
 }
 
@@ -181,12 +205,26 @@ pub(crate) fn check_document_size(doc: &Value) -> Result<(), ProofError> {
 }
 
 /// Step 4 over an already-resolved DID document (split out for testing).
+#[cfg(test)]
 pub(crate) fn authentication_key_in(
     doc: &Value,
     issuer: &str,
     vm: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ResolvedKey, ProofError> {
+    key_for_purpose_in(doc, issuer, vm, PROOF_PURPOSE, now)
+}
+
+/// Step 4 for any signing `purpose`: the relationship the purpose names is the
+/// DID-document property the method must be listed (or embedded) under.
+pub(crate) fn key_for_purpose_in(
+    doc: &Value,
+    issuer: &str,
+    vm: &str,
+    purpose: ProofPurpose,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<ResolvedKey, ProofError> {
+    let relationship = purpose.as_str();
     if doc.get("id").and_then(Value::as_str) != Some(issuer) {
         return Err(invalid("resolved DID document is not the issuer's"));
     }
@@ -200,7 +238,7 @@ pub(crate) fn authentication_key_in(
         .chain(
             // An `authentication` entry may embed its method rather than
             // reference one from `verificationMethod`.
-            doc.get(RELATIONSHIP)
+            doc.get(relationship)
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
@@ -234,7 +272,7 @@ pub(crate) fn authentication_key_in(
     }
 
     let is_listed = doc
-        .get(RELATIONSHIP)
+        .get(relationship)
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -244,9 +282,9 @@ pub(crate) fn authentication_key_in(
             _ => false,
         });
     if !is_listed {
-        return Err(invalid(
-            "the proof's verificationMethod is not an authentication method of the issuer",
-        ));
+        return Err(ProofError::Invalid(format!(
+            "the proof's verificationMethod is not an {relationship} method of the issuer"
+        )));
     }
 
     let multibase = method
@@ -270,20 +308,6 @@ fn absolute(did: &str, id: &str) -> String {
         format!("{did}{id}")
     } else {
         id.to_string()
-    }
-}
-
-/// A resolver that answers with the one key [`authentication_key_in`] already
-/// selected, so the signature is checked against exactly that key.
-struct PinnedKey(ResolvedKey);
-
-#[async_trait]
-impl VerificationMethodResolver for PinnedKey {
-    async fn resolve_vm(&self, _vm: &str) -> Result<ResolvedKey, DataIntegrityError> {
-        Ok(ResolvedKey::new(
-            self.0.key_type,
-            self.0.public_key_bytes.clone(),
-        ))
     }
 }
 

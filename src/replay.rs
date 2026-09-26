@@ -4,7 +4,7 @@
 //! own bounded record, so no issuer can evict another's entries or occupy an
 //! identifier another issuer will use. Records are only ever created for a
 //! caller that has already been authorised for the operation (see
-//! `didcomm::handle_envelope`), so an unauthorised party creates none.
+//! `intake::receive_document`), so an unauthorised party creates none.
 //!
 //! When a bound is reached the record **refuses** new documents rather than
 //! evicting live entries — eviction would make the evicted documents

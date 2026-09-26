@@ -1,8 +1,13 @@
-//! The DIDComm adapter authorises `push/provision` and `push/wake` on the
-//! issuer a document's Data Integrity proof establishes — never on the
-//! envelope sender alone. Drives [`didcomm::handle_envelope`] (everything the
-//! DIDComm handler does after the service has unpacked a message) with
-//! `did:key` parties, which resolve offline.
+//! `push/provision` and `push/wake` are authorised on the issuer a document's
+//! Data Integrity proof establishes — never on a transport's claim about its
+//! sender — and identically on every transport the gateway serves.
+//!
+//! Most tests drive [`intake::receive`] directly: it is everything a transport
+//! adapter does after unpacking (the DIDComm handler passes the envelope's
+//! `from` as the transport sender). The `every_transport` tests run the same
+//! documents through both adapters — DIDComm's handoff and `POST /trust-tasks`
+//! — and expect the same answers. Parties are `did:key`s, which resolve
+//! offline.
 
 use std::sync::Arc;
 
@@ -13,10 +18,15 @@ use ed25519_dalek::SigningKey;
 use rand::Rng;
 use serde_json::{json, Value};
 
-use vti_push_gateway::api::AppState;
+use axum::body::Body;
+use axum::http::Request;
+use http_body_util::BodyExt;
+use tower::ServiceExt;
+
+use vti_push_gateway::api::{router, AppState};
 use vti_push_gateway::controllers::ControllerPolicy;
-use vti_push_gateway::didcomm::{handle_envelope, DidcommState};
 use vti_push_gateway::egress::EgressPolicy;
+use vti_push_gateway::intake;
 use vti_push_gateway::limits::Limits;
 use vti_push_gateway::proof::ProofVerifier;
 use vti_push_gateway::sender::{EchoSender, PushSender};
@@ -67,9 +77,12 @@ impl Party {
     }
 }
 
-async fn didcomm_state() -> DidcommState {
+async fn test_state() -> AppState {
     let senders: Vec<Box<dyn PushSender>> = vec![Box::new(EchoSender)];
-    let app = AppState {
+    let client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+        .await
+        .expect("resolver");
+    AppState {
         store: Arc::new(Store::new()),
         senders: Arc::new(senders),
         gateway_addr: "https://gw.test".into(),
@@ -80,14 +93,8 @@ async fn didcomm_state() -> DidcommState {
         // These suites mint a fresh controller per test; the allowlist has
         // its own tests.
         controllers: Arc::new(vti_push_gateway::controllers::ControllerPolicy::Open),
-    };
-    let client = DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
-        .await
-        .expect("resolver");
-    DidcommState {
-        app,
         proofs: ProofVerifier::new(Arc::new(client)),
-        gateway_did: GATEWAY_DID.into(),
+        gateway_did: Some(GATEWAY_DID.into()),
     }
 }
 
@@ -118,12 +125,44 @@ fn error_code(doc: &Value) -> String {
         .to_string()
 }
 
-async fn send(st: &DidcommState, from: Option<&str>, body: &Value) -> Value {
-    handle_envelope(st, from, body).await.expect("a response")
+/// Hand `body` to the intake as a transport would, with `from` as the
+/// transport's claim about its sender (a DIDComm envelope's `from`).
+async fn send(st: &AppState, from: Option<&str>, body: &Value) -> Value {
+    intake::receive(st, from, body).await.expect("a response")
+}
+
+/// The transports the gateway serves.
+#[derive(Debug, Clone, Copy)]
+enum Transport {
+    /// The DIDComm adapter's handoff: the unpacked body, with the envelope's
+    /// `from` as the transport sender.
+    Didcomm,
+    /// `POST /trust-tasks` through the real HTTP router.
+    Https,
+}
+
+const TRANSPORTS: [Transport; 2] = [Transport::Didcomm, Transport::Https];
+
+async fn send_via(st: &AppState, t: Transport, from: &str, body: &Value) -> Value {
+    match t {
+        Transport::Didcomm => send(st, Some(from), body).await,
+        Transport::Https => {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/trust-tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(body).unwrap()))
+                .unwrap();
+            let resp = router(st.clone()).oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::OK, "{t:?}");
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            serde_json::from_slice(&bytes).unwrap()
+        }
+    }
 }
 
 /// Register a handle controlled by `controller` over DIDComm (anonymously).
-async fn register(st: &DidcommState, controller: &str) -> String {
+async fn register(st: &AppState, controller: &str) -> String {
     let reg = doc(
         PUSH_REGISTER,
         None,
@@ -158,7 +197,7 @@ fn wake_doc(issuer: &str, handle: &str) -> Value {
 
 #[tokio::test]
 async fn signed_provision_and_wake_succeed() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let trigger = Party::new();
     let handle = register(&st, &vta.did).await;
@@ -179,7 +218,7 @@ async fn signed_provision_and_wake_succeed() {
 /// carrying a valid proof is accepted.
 #[tokio::test]
 async fn a_valid_proof_needs_no_envelope_sender() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let handle = register(&st, &vta.did).await;
     let prov = vta.sign(provision_doc(&vta.did, &handle, &vta.did)).await;
@@ -191,7 +230,7 @@ async fn a_valid_proof_needs_no_envelope_sender() {
 /// document is anonymous and provision/wake are refused.
 #[tokio::test]
 async fn envelope_sender_alone_does_not_authorise() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let attacker = Party::new();
     let handle = register(&st, &vta.did).await;
@@ -216,7 +255,7 @@ async fn envelope_sender_alone_does_not_authorise() {
 /// issuer binding.
 #[tokio::test]
 async fn proof_by_another_key_is_refused() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let attacker = Party::new();
     let handle = register(&st, &vta.did).await;
@@ -231,7 +270,7 @@ async fn proof_by_another_key_is_refused() {
 /// A genuine proof whose document was edited afterwards does not verify.
 #[tokio::test]
 async fn tampered_document_is_refused() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let attacker = Party::new();
     let handle = register(&st, &vta.did).await;
@@ -246,7 +285,7 @@ async fn tampered_document_is_refused() {
 /// the controller check, as over HTTPS.
 #[tokio::test]
 async fn non_controller_with_a_valid_proof_is_refused() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let attacker = Party::new();
     let handle = register(&st, &vta.did).await;
@@ -261,7 +300,7 @@ async fn non_controller_with_a_valid_proof_is_refused() {
 /// When the envelope names a sender, it must be the proven issuer.
 #[tokio::test]
 async fn envelope_sender_contradicting_the_proof_is_refused() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let other = Party::new();
     let handle = register(&st, &vta.did).await;
@@ -275,7 +314,7 @@ async fn envelope_sender_contradicting_the_proof_is_refused() {
 /// A signed document addressed to another gateway is refused.
 #[tokio::test]
 async fn document_for_another_recipient_is_refused() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let handle = register(&st, &vta.did).await;
 
@@ -290,7 +329,7 @@ async fn document_for_another_recipient_is_refused() {
 /// refused even though it verifies (VTI-KEY-106).
 #[tokio::test]
 async fn assertion_method_proof_is_refused() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let handle = register(&st, &vta.did).await;
 
@@ -311,7 +350,7 @@ async fn assertion_method_proof_is_refused() {
 /// signed document must name one (VTI-KEY-107).
 #[tokio::test]
 async fn signed_document_without_a_recipient_is_refused() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let handle = register(&st, &vta.did).await;
     let mut prov = provision_doc(&vta.did, &handle, &vta.did);
@@ -324,7 +363,7 @@ async fn signed_document_without_a_recipient_is_refused() {
 /// (VTI-OPS-024).
 #[tokio::test]
 async fn time_of_issue_outside_the_window_is_refused() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let handle = register(&st, &vta.did).await;
     let now = chrono::Utc::now();
@@ -349,7 +388,7 @@ async fn time_of_issue_outside_the_window_is_refused() {
 /// with the first response and no second push goes out (VTI-OPS-026).
 #[tokio::test]
 async fn replayed_document_is_not_executed_twice() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let handle = register(&st, &vta.did).await;
     let prov = vta.sign(provision_doc(&vta.did, &handle, &vta.did)).await;
@@ -358,23 +397,19 @@ async fn replayed_document_is_not_executed_twice() {
     let wake = vta.sign(wake_doc(&vta.did, &handle)).await;
     let first = send(&st, Some(&vta.did), &wake).await;
     assert!(is_success(&first), "{first}");
-    let delivered = st.app.metrics.render();
+    let delivered = st.metrics.render();
     let again = send(&st, Some(&vta.did), &wake).await;
     assert_eq!(
         again, first,
         "a duplicate is answered with the first response"
     );
-    assert_eq!(
-        st.app.metrics.render(),
-        delivered,
-        "and nothing is sent again"
-    );
+    assert_eq!(st.metrics.render(), delivered, "and nothing is sent again");
 }
 
 /// A different document reusing an accepted identifier is refused.
 #[tokio::test]
 async fn reused_identifier_is_refused() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let handle = register(&st, &vta.did).await;
     let first = provision_doc(&vta.did, &handle, &vta.did);
@@ -391,21 +426,18 @@ async fn reused_identifier_is_refused() {
 
 // ── Regression: the replay record and the time bounds ───────────────────
 
-fn with_senders(st: DidcommState, senders: Vec<Box<dyn PushSender>>) -> DidcommState {
-    let mut app = st.app.clone();
-    app.senders = Arc::new(senders);
-    DidcommState { app, ..st }
+fn with_senders(mut st: AppState, senders: Vec<Box<dyn PushSender>>) -> AppState {
+    st.senders = Arc::new(senders);
+    st
 }
 
-fn with_record(st: DidcommState, record: vti_push_gateway::replay::ReplayRecord) -> DidcommState {
-    let mut app = st.app.clone();
-    app.replay = Arc::new(record);
-    DidcommState { app, ..st }
+fn with_record(mut st: AppState, record: vti_push_gateway::replay::ReplayRecord) -> AppState {
+    st.replay = Arc::new(record);
+    st
 }
 
-fn delivered(st: &DidcommState) -> String {
-    st.app
-        .metrics
+fn delivered(st: &AppState) -> String {
+    st.metrics
         .render()
         .lines()
         .filter(|l| l.contains("delivered"))
@@ -414,7 +446,7 @@ fn delivered(st: &DidcommState) -> String {
 }
 
 /// A handle whose allowlist holds `triggers`, provisioned by `vta`.
-async fn provisioned(st: &DidcommState, vta: &Party, triggers: &[&str]) -> String {
+async fn provisioned(st: &AppState, vta: &Party, triggers: &[&str]) -> String {
     let handle = register(st, &vta.did).await;
     let prov = doc(
         PUSH_PROVISION,
@@ -430,7 +462,7 @@ async fn provisioned(st: &DidcommState, vta: &Party, triggers: &[&str]) -> Strin
 /// delivery — even though its `issuedAt` is inside the window.
 #[tokio::test]
 async fn an_already_expired_document_is_refused() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let trigger = Party::new();
     let handle = provisioned(&st, &vta, &[&trigger.did]).await;
@@ -446,7 +478,7 @@ async fn an_already_expired_document_is_refused() {
     }
     assert_eq!(delivered(&st), before, "nothing was sent");
     assert_eq!(
-        st.app.replay.len_for(&trigger.did),
+        st.replay.len_for(&trigger.did),
         0,
         "and nothing was recorded"
     );
@@ -456,7 +488,7 @@ async fn an_already_expired_document_is_refused() {
 /// the victim's genuine document is accepted.
 #[tokio::test]
 async fn an_unauthorised_issuer_cannot_squat_an_identifier() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let trigger = Party::new();
     let attacker = Party::new();
@@ -468,7 +500,7 @@ async fn an_unauthorised_issuer_cannot_squat_an_identifier() {
     let resp = send(&st, None, &attacker.sign(squat).await).await;
     assert_eq!(error_code(&resp), "permissionDenied", "{resp}");
     assert_eq!(
-        st.app.replay.len_for(&attacker.did),
+        st.replay.len_for(&attacker.did),
         0,
         "a refused caller leaves no record"
     );
@@ -485,7 +517,7 @@ async fn an_unauthorised_issuer_cannot_squat_an_identifier() {
 #[tokio::test]
 async fn an_unauthorised_flood_cannot_evict_a_record() {
     let st = with_record(
-        didcomm_state().await,
+        test_state().await,
         vti_push_gateway::replay::ReplayRecord::new(50, 50),
     );
     let vta = Party::new();
@@ -514,7 +546,7 @@ async fn an_unauthorised_flood_cannot_evict_a_record() {
 #[tokio::test]
 async fn one_issuer_cannot_evict_anothers_records() {
     let st = with_record(
-        didcomm_state().await,
+        test_state().await,
         vti_push_gateway::replay::ReplayRecord::new(5, 1_000),
     );
     let vta = Party::new();
@@ -528,11 +560,7 @@ async fn one_issuer_cannot_evict_anothers_records() {
         let resp = send(&st, None, &a.sign(wake_doc(&a.did, &handle)).await).await;
         assert_eq!(is_success(&resp), i < 5, "#{i}: {resp}");
     }
-    assert_eq!(
-        st.app.replay.len_for(&a.did),
-        5,
-        "a's own records were kept"
-    );
+    assert_eq!(st.replay.len_for(&a.did), 5, "a's own records were kept");
     let sent = delivered(&st);
     assert_eq!(
         send(&st, None, &b_wake).await,
@@ -545,7 +573,7 @@ async fn one_issuer_cannot_evict_anothers_records() {
 /// The same id from two different issuers are two documents.
 #[tokio::test]
 async fn the_record_is_keyed_by_issuer_and_id() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let a = Party::new();
     let b = Party::new();
@@ -584,7 +612,7 @@ impl PushSender for FlakySender {
 #[tokio::test]
 async fn a_transient_failure_is_retried_not_cached() {
     let st = with_senders(
-        didcomm_state().await,
+        test_state().await,
         vec![Box::new(FlakySender(std::sync::atomic::AtomicUsize::new(
             0,
         )))],
@@ -607,7 +635,7 @@ async fn a_transient_failure_is_retried_not_cached() {
 /// A refused provision (wrong controller) leaves no record either.
 #[tokio::test]
 async fn a_refused_provision_leaves_no_record() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let vta = Party::new();
     let other = Party::new();
     let handle = register(&st, &vta.did).await;
@@ -618,7 +646,7 @@ async fn a_refused_provision_leaves_no_record() {
         error_code(&send(&st, None, &prov).await),
         "permissionDenied"
     );
-    assert_eq!(st.app.replay.len_for(&other.did), 0);
+    assert_eq!(st.replay.len_for(&other.did), 0);
 }
 
 // ── Regression: self-registered controllers cannot exhaust the record ───
@@ -629,7 +657,7 @@ async fn a_refused_provision_leaves_no_record() {
 #[tokio::test]
 async fn self_registered_controllers_cannot_lock_others_out() {
     let st = with_record(
-        didcomm_state().await,
+        test_state().await,
         vti_push_gateway::replay::ReplayRecord::new(8192, 100),
     );
     let legit_vta = Party::new();
@@ -661,7 +689,7 @@ async fn self_registered_controllers_cannot_lock_others_out() {
 /// ids changes nothing, so it spends no record at all.
 #[tokio::test]
 async fn reapplying_the_stored_allowlist_spends_no_record() {
-    let st = didcomm_state().await;
+    let st = test_state().await;
     let a = Party::new();
     let ah = register(&st, &a.did).await;
     for _ in 0..40 {
@@ -669,7 +697,7 @@ async fn reapplying_the_stored_allowlist_spends_no_record() {
         assert!(is_success(&send(&st, None, &p).await));
     }
     assert_eq!(
-        st.app.replay.len_for(&a.did),
+        st.replay.len_for(&a.did),
         1,
         "only the provision that changed something"
     );
@@ -679,7 +707,7 @@ async fn reapplying_the_stored_allowlist_spends_no_record() {
 #[tokio::test]
 async fn one_handle_cannot_spend_more_than_its_budget() {
     let st = with_record(
-        didcomm_state().await,
+        test_state().await,
         vti_push_gateway::replay::ReplayRecord::with_per_handle(8192, 3, 65_536),
     );
     let vta = Party::new();
@@ -693,7 +721,7 @@ async fn one_handle_cannot_spend_more_than_its_budget() {
         }
     }
     assert_eq!(ok, 2, "the handle's 3-record budget: 1 provision + 2 wakes");
-    assert_eq!(st.app.replay.len_for_handle(&handle), 3);
+    assert_eq!(st.replay.len_for_handle(&handle), 3);
     // Another handle is unaffected.
     let other = provisioned(&st, &vta, &[&triggers[0].did]).await;
     let r = send(
@@ -707,10 +735,9 @@ async fn one_handle_cannot_spend_more_than_its_budget() {
 
 // ── The controller allowlist ────────────────────────────────────────────
 
-fn with_controllers(st: DidcommState, policy: ControllerPolicy) -> DidcommState {
-    let mut app = st.app.clone();
-    app.controllers = Arc::new(policy);
-    DidcommState { app, ..st }
+fn with_controllers(mut st: AppState, policy: ControllerPolicy) -> AppState {
+    st.controllers = Arc::new(policy);
+    st
 }
 
 fn register_doc(controller: &str, n: usize) -> Value {
@@ -727,7 +754,7 @@ fn register_doc(controller: &str, n: usize) -> Value {
 /// The default — nothing listed — refuses every registration.
 #[tokio::test]
 async fn by_default_no_controller_is_served() {
-    let st = with_controllers(didcomm_state().await, ControllerPolicy::default());
+    let st = with_controllers(test_state().await, ControllerPolicy::default());
     let resp = send(&st, None, &register_doc(&Party::new().did, 1)).await;
     assert_eq!(error_code(&resp), "permissionDenied", "{resp}");
 }
@@ -739,13 +766,13 @@ async fn only_listed_controllers_may_register() {
     let vta = Party::new();
     let trigger = Party::new();
     let st = with_controllers(
-        didcomm_state().await,
+        test_state().await,
         ControllerPolicy::listing([vta.did.clone()]),
     );
 
     let resp = send(&st, None, &register_doc(&Party::new().did, 1)).await;
     assert_eq!(error_code(&resp), "permissionDenied", "{resp}");
-    assert_eq!(st.app.store.len(), 0, "nothing was stored");
+    assert_eq!(st.store.len(), 0, "nothing was stored");
 
     let handle = provisioned(&st, &vta, &[&trigger.did]).await;
     let resp = send(
@@ -762,20 +789,20 @@ async fn only_listed_controllers_may_register() {
 #[tokio::test]
 async fn a_delisted_controller_cannot_provision() {
     let vta = Party::new();
-    let st = didcomm_state().await; // open, to register the handle
+    let st = test_state().await; // open, to register the handle
     let handle = register(&st, &vta.did).await;
     let st = with_controllers(st, ControllerPolicy::default());
     let prov = vta.sign(provision_doc(&vta.did, &handle, &vta.did)).await;
     let resp = send(&st, None, &prov).await;
     assert_eq!(error_code(&resp), "permissionDenied", "{resp}");
-    assert_eq!(st.app.replay.len_for(&vta.did), 0, "and spends no record");
+    assert_eq!(st.replay.len_for(&vta.did), 0, "and spends no record");
 }
 
 /// Open mode admits any controller, and every other bound still holds.
 #[tokio::test]
 async fn open_mode_keeps_the_limits() {
-    let mut st = with_controllers(didcomm_state().await, ControllerPolicy::Open);
-    st.app.store = Arc::new(Store::with_limits(vti_push_gateway::store::StoreLimits {
+    let mut st = with_controllers(test_state().await, ControllerPolicy::Open);
+    st.store = Arc::new(Store::with_limits(vti_push_gateway::store::StoreLimits {
         max_per_controller: 2,
         ..Default::default()
     }));
@@ -801,4 +828,171 @@ async fn open_mode_keeps_the_limits() {
         "taskFailed",
         "the per-handle budget still applies: {resp}"
     );
+}
+
+// ── The same authorisation on every transport ───────────────────────────
+
+/// Sign `doc` with an `assertionMethod` proof: it verifies, but it is an
+/// attestation, not the issuer's operational message.
+async fn sign_for_assertion(p: &Party, mut doc: Value) -> Value {
+    let proof = DataIntegrityProof::sign(
+        &doc,
+        &p.secret,
+        SignOptions::new().with_proof_purpose("assertionMethod"),
+    )
+    .await
+    .unwrap();
+    doc["proof"] = serde_json::to_value(&proof).unwrap();
+    doc
+}
+
+/// Signed by an allowed (listed) controller: accepted, and the wake it
+/// authorises is delivered — over each transport.
+#[tokio::test]
+async fn every_transport_accepts_a_listed_controllers_signed_documents() {
+    for t in TRANSPORTS {
+        let vta = Party::new();
+        let trigger = Party::new();
+        let st = with_controllers(
+            test_state().await,
+            ControllerPolicy::listing([vta.did.clone()]),
+        );
+        let handle = register(&st, &vta.did).await;
+        let prov = vta
+            .sign(provision_doc(&vta.did, &handle, &trigger.did))
+            .await;
+        let resp = send_via(&st, t, &vta.did, &prov).await;
+        assert!(is_success(&resp), "{t:?} provision: {resp}");
+        let wake = trigger.sign(wake_doc(&trigger.did, &handle)).await;
+        let resp = send_via(&st, t, &trigger.did, &wake).await;
+        assert!(is_success(&resp), "{t:?} wake: {resp}");
+        assert_eq!(resp["payload"]["status"], "delivered", "{t:?}");
+    }
+}
+
+/// Wrong issuer, unsigned, stale, replayed, or signed for `assertionMethod`:
+/// refused alike on each transport, and the allowlist is left as it was.
+#[tokio::test]
+async fn every_transport_refuses_what_the_proof_does_not_authorise() {
+    for t in TRANSPORTS {
+        let vta = Party::new();
+        let attacker = Party::new();
+        let st = with_controllers(
+            test_state().await,
+            ControllerPolicy::listing([vta.did.clone()]),
+        );
+        let handle = register(&st, &vta.did).await;
+
+        // Wrong issuer: a correctly signed document by a party that is not
+        // an allowed controller.
+        let resp = send_via(
+            &st,
+            t,
+            &attacker.did,
+            &attacker
+                .sign(provision_doc(&attacker.did, &handle, &attacker.did))
+                .await,
+        )
+        .await;
+        assert_eq!(error_code(&resp), "permissionDenied", "{t:?}: {resp}");
+
+        // Wrong issuer: naming the controller, signed by another key.
+        let resp = send_via(
+            &st,
+            t,
+            &vta.did,
+            &attacker
+                .sign(provision_doc(&vta.did, &handle, &attacker.did))
+                .await,
+        )
+        .await;
+        assert_eq!(error_code(&resp), "proofInvalid", "{t:?}: {resp}");
+
+        // Unsigned.
+        let resp = send_via(
+            &st,
+            t,
+            &vta.did,
+            &provision_doc(&vta.did, &handle, &attacker.did),
+        )
+        .await;
+        assert_eq!(error_code(&resp), "proofRequired", "{t:?}: {resp}");
+
+        // Stale.
+        let mut stale = provision_doc(&vta.did, &handle, &attacker.did);
+        stale["issuedAt"] =
+            json!((chrono::Utc::now() - chrono::TimeDelta::minutes(10)).to_rfc3339());
+        let resp = send_via(&st, t, &vta.did, &vta.sign(stale).await).await;
+        assert_eq!(error_code(&resp), "expired", "{t:?}: {resp}");
+
+        // Signed for assertionMethod.
+        let resp = send_via(
+            &st,
+            t,
+            &vta.did,
+            &sign_for_assertion(&vta, provision_doc(&vta.did, &handle, &attacker.did)).await,
+        )
+        .await;
+        assert_eq!(error_code(&resp), "proofInvalid", "{t:?}: {resp}");
+
+        // None of that touched the allowlist: the attacker cannot wake.
+        let resp = send_via(
+            &st,
+            t,
+            &attacker.did,
+            &attacker.sign(wake_doc(&attacker.did, &handle)).await,
+        )
+        .await;
+        assert_eq!(error_code(&resp), "permissionDenied", "{t:?}: {resp}");
+
+        // Replayed: executed once, then answered from the record.
+        let prov = vta.sign(provision_doc(&vta.did, &handle, &vta.did)).await;
+        let first = send_via(&st, t, &vta.did, &prov).await;
+        assert!(is_success(&first), "{t:?}: {first}");
+        let wake = vta.sign(wake_doc(&vta.did, &handle)).await;
+        let first = send_via(&st, t, &vta.did, &wake).await;
+        assert!(is_success(&first), "{t:?}: {first}");
+        let sent = delivered(&st);
+        let again = send_via(&st, t, &vta.did, &wake).await;
+        assert_eq!(again, first, "{t:?}: a replay gets the first answer");
+        assert_eq!(delivered(&st), sent, "{t:?}: and nothing is sent again");
+    }
+}
+
+/// The record is shared by the transports: a document accepted on one is a
+/// replay on the other.
+#[tokio::test]
+async fn a_replay_on_another_transport_is_still_a_replay() {
+    let st = test_state().await;
+    let vta = Party::new();
+    let handle = provisioned(&st, &vta, &[&vta.did]).await;
+    let wake = vta.sign(wake_doc(&vta.did, &handle)).await;
+    let first = send_via(&st, Transport::Didcomm, &vta.did, &wake).await;
+    assert!(is_success(&first), "{first}");
+    let sent = delivered(&st);
+    let again = send_via(&st, Transport::Https, &vta.did, &wake).await;
+    assert_eq!(again, first);
+    assert_eq!(delivered(&st), sent, "not sent again");
+}
+
+/// A gateway with no DID can be no document's recipient, so it accepts no
+/// signed provision or wake; anonymous registration still works.
+#[tokio::test]
+async fn a_gateway_without_a_did_accepts_no_signed_document() {
+    let mut st = test_state().await;
+    let vta = Party::new();
+    let handle = register(&st, &vta.did).await;
+    st.gateway_did = None;
+    for t in TRANSPORTS {
+        let mut prov = provision_doc(&vta.did, &handle, &vta.did);
+        prov.as_object_mut().unwrap().remove("recipient");
+        let resp = send_via(&st, t, &vta.did, &vta.sign(prov).await).await;
+        assert_eq!(error_code(&resp), "taskFailed", "{t:?}: {resp}");
+        let prov = vta.sign(provision_doc(&vta.did, &handle, &vta.did)).await;
+        let resp = send_via(&st, t, &vta.did, &prov).await;
+        assert_eq!(error_code(&resp), "wrongRecipient", "{t:?}: {resp}");
+    }
+    let mut reg = register_doc(&vta.did, 7);
+    reg.as_object_mut().unwrap().remove("recipient");
+    assert!(is_success(&send(&st, None, &reg).await));
 }

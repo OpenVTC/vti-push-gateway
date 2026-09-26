@@ -27,7 +27,9 @@ The gateway's control plane is the **`push/*` Trust Task family**
 [`push/provision`](https://trusttasks.org/spec/push/provision/0.2),
 [`push/wake`](https://trusttasks.org/spec/push/wake/0.2)). It dispatches
 `TrustTask` documents (canonical `trust-tasks-rs` envelope), so the same
-documents ride the **DIDComm binding (preferred) or HTTPS (fallback)**.
+documents ride **DIDComm or HTTPS**, and every transport hands them to one
+intake (`src/intake.rs`) that authorises them identically — by the document's
+own proof, never by the transport (see "Authentication" below).
 
 Implemented: both transports (HTTPS + DIDComm) + in-memory stores + four
 senders — a real **Web Push (VAPID)** sender (`GATEWAY_VAPID_KEY_FILE`,
@@ -46,10 +48,15 @@ restart).
 
 **DIDComm transport (preferred)** is wired: when `GATEWAY_IDENTITY_FILE`
 provides the gateway's provisioned `did:webvh` identity, a `DIDCommService`
-(`affinidi-messaging-didcomm-service`) connects to the mediator and dispatches
-inbound `push/*` to the same core — the crate does the unpack, and the gateway
-authenticates `push/provision` / `push/wake` by the Data Integrity proof on the
-Trust Task document (see "Authentication" below).
+(`affinidi-messaging-didcomm-service`) connects to the mediator and hands
+inbound `push/*` to the shared intake — the crate does the unpack, and the
+intake authenticates `push/provision` / `push/wake` by the Data Integrity proof
+on the Trust Task document, exactly as for `POST /trust-tasks`. The identity is
+also what makes the gateway addressable: without it the gateway has no DID for
+a document to name as its `recipient`, so it serves `push/register` only.
+TSP is not served yet; adding it is one more adapter calling the same intake
+(a TSP listener under the gateway's identity, advertised as `TSPTransport` in
+its DID document), with no change to authorisation.
 Identity is provisioned like any integration: `pnm bootstrap
 provision-integration --template push-gateway --var URL=<gateway-didcomm-url>`,
 then open the bundle into the identity file.
@@ -77,11 +84,11 @@ registry · metrics · resolver tuning).
 
 A single Trust-Task endpoint dispatches by the document's `type`:
 
-| Method | Path            | `type`                | Caller | Auth (HTTPS) |
-|--------|-----------------|-----------------------|--------|--------------|
+| Method | Path            | `type`                | Caller | Auth |
+|--------|-----------------|-----------------------|--------|------|
 | POST   | `/trust-tasks`  | `push/register/0.2`   | device | none |
-| POST   | `/trust-tasks`  | `push/provision/0.2`  | controller VTA | did-signed |
-| POST   | `/trust-tasks`  | `push/wake/0.2`       | trigger (mediator/VTA) | did-signed |
+| POST   | `/trust-tasks`  | `push/provision/0.2`  | controller VTA | document proof |
+| POST   | `/trust-tasks`  | `push/wake/0.2`       | trigger (mediator/VTA) | document proof |
 | GET    | `/healthz`      | —                     | — | none |
 
 On the **management** listener (`GATEWAY_METRICS_BIND`, default
@@ -97,36 +104,34 @@ Success returns a `…#response` Trust Task document; failure returns a
 
 ### Authentication (`provision`, `wake`)
 
-Over **HTTPS** the caller signs the **raw request body bytes** (the Trust Task
-document) with its `did:key` Ed25519 key:
-
-- `X-TT-Did: did:key:z…` — the caller's did:key (Ed25519).
-- `X-TT-Signature: <base64url>` — Ed25519 signature over the exact body bytes.
-
-The gateway resolves the did:key offline (multicodec/base58btc — no network) and
-verifies. `register` is unauthenticated (the handle is opaque and useless until
-the device's VTA provisions a trigger). Replay is harmless by design (a
-duplicate wake is an idempotent doorbell), so no nonce is required — see
-binding §6.
-
-Over the **DIDComm** transport the caller signs the Trust Task document itself
-with its **operational** key: an `eddsa-jcs-2022` Data Integrity proof with
+The same on every transport. `register` is unauthenticated (the handle is
+opaque and useless until the device's VTA provisions a trigger). For
+`provision` and `wake` the caller signs the Trust Task document itself with its
+**operational** key: an `eddsa-jcs-2022` Data Integrity proof with
 `proofPurpose: authentication` (VTI-KEY-106 — these are the caller's own
-messages, not attestations, so an `assertionMethod` proof is refused). The
-caller is the document's `issuer`, and only when:
+messages, not attestations, so an `assertionMethod` proof is refused). This is
+how the VTA sends them. The caller is the document's `issuer`, and only when:
 
 - the DID of `proof.verificationMethod` is the `issuer`;
 - the issuer's DID document lists that method, with `controller` equal to the
-  issuer, under `authentication`;
+  issuer, under `authentication`, and the method is neither revoked nor
+  expired (checked through trust-tasks-proof's `ProofPurposeResolver` /
+  `PurposeBound`);
 - the signature verifies over the document without its `proof`.
+
+No transport-level identity authorises anything: HTTP headers carry none (the
+old `X-TT-Did` / `X-TT-Signature` body signature is gone), and a DIDComm
+envelope's `from` must merely agree with the proven issuer.
 
 An `authentication` proof carries no challenge, so the document binds it to one
 delivery (VTI-KEY-107): it must name this gateway as `recipient`, carry an
 `issuedAt` no more than 5 minutes old and no more than 60 s in the future
 (VTI-OPS-024; `expired` / `malformedRequest` otherwise) and not be past its
 `expiresAt`, and carry an `id` the same issuer has not already had accepted
-within that window (VTI-OPS-026). The record is keyed by (issuer, id), bounded
-per issuer, and claimed only after the caller has been rate-limited and
+within that window (VTI-OPS-026). The record is keyed by (proven issuer, id),
+shared by every transport (a document accepted over DIDComm is a replay over
+HTTPS), bounded, fail-closed (full means refused, never evicted), and claimed
+only after the caller has been rate-limited and
 authorised for the handle, so a refused caller leaves nothing in it. A second
 delivery of an accepted document is answered with the first response and not
 executed again; a different document under the same issuer's accepted `id`
@@ -163,11 +168,12 @@ IP over HTTPS); the DIDComm path has no trustworthy anonymous source to key a
 per-source budget on.
 
 `push/provision` then requires that issuer to be the handle's
-`controllerVtaDid`; `push/wake` requires it to be on the allowlist. The DIDComm
-envelope sender is never an authorising identity on its own: a document without
-a proof is anonymous (`push/register` only; provision/wake get `proofRequired`),
-an envelope sender that differs from the proven issuer gets `identityMismatch`,
-and a document whose `recipient` is not this gateway gets `wrongRecipient`.
+`controllerVtaDid`; `push/wake` requires it to be on the allowlist. A
+transport's sender is never an authorising identity on its own: a document
+without a proof is anonymous (`push/register` only; provision/wake get
+`proofRequired`), a DIDComm envelope sender that differs from the proven issuer
+gets `identityMismatch`, and a document whose `recipient` is not this gateway's
+DID gets `wrongRecipient`.
 
 ### Example (HTTPS)
 
@@ -180,11 +186,17 @@ and a document whose `recipient` is not this gateway gets `wrongRecipient`.
 
 // POST /trust-tasks   — push/provision (signed by the controller VTA)
 { "id": "urn:uuid:2", "type": "https://trusttasks.org/spec/push/provision/0.2",
-  "payload": { "handle": "z6Mk…", "policy": { "allowedTriggers": ["did:webvh:…:mediator", "did:webvh:…:vta"] } } }
+  "issuer": "did:webvh:…:vta", "recipient": "did:webvh:…:push-gateway",
+  "issuedAt": "2026-09-26T10:00:00Z",
+  "payload": { "handle": "z6Mk…", "policy": { "allowedTriggers": ["did:webvh:…:mediator", "did:webvh:…:vta"] } },
+  "proof": { "type": "DataIntegrityProof", "cryptosuite": "eddsa-jcs-2022",
+             "proofPurpose": "authentication", "verificationMethod": "did:webvh:…:vta#key-0", "proofValue": "z…" } }
 
-// POST /trust-tasks   — push/wake (signed by an allowed trigger)
+// POST /trust-tasks   — push/wake (signed by an allowed trigger, likewise)
 { "id": "urn:uuid:3", "type": "https://trusttasks.org/spec/push/wake/0.2",
-  "payload": { "handle": "z6Mk…", "v": 1, "mediator": "did:webvh:…:mediator", "urgency": "interactive" } }
+  "issuer": "did:webvh:…:vta", "recipient": "did:webvh:…:push-gateway", "issuedAt": "…",
+  "payload": { "handle": "z6Mk…", "v": 1, "mediator": "did:webvh:…:mediator", "urgency": "interactive" },
+  "proof": { … } }
 // → 200  …#response  { "payload": { "status": "delivered" } }  (echo sender logs the contentless wake)
 ```
 
@@ -287,8 +299,9 @@ cargo run
 ```
 
 With `GATEWAY_IDENTITY_FILE` set the gateway connects to the mediator named in
-the identity and serves `push/*` over DIDComm (preferred) as well as HTTPS;
-without it, HTTPS-only. See `src/identity.rs` for the identity file shape.
+the identity and serves `push/*` over DIDComm as well as HTTPS, with the same
+authorisation on both; without it there is no gateway DID to address documents
+to, so only `push/register` (over HTTPS) is served. See `src/identity.rs` for the identity file shape.
 
 ## Testing Web Push end-to-end
 
@@ -314,9 +327,9 @@ The wake loop spans the gateway, a VTA + mediator, and the browser plugin. A
    #        the device/plugin applicationServerKey
    ```
 
-   For the **DIDComm** transport (preferred) also provision a gateway identity
-   and set `GATEWAY_IDENTITY_FILE` (see above). For an HTTPS-only smoke test,
-   omit it and set `GATEWAY_ADDR=http://127.0.0.1:8300`.
+   Provision a gateway identity and set `GATEWAY_IDENTITY_FILE` (see above):
+   signed provisions and wakes are addressed to the gateway's DID, on DIDComm
+   and HTTPS alike, so a gateway without one accepts none.
 
 3. **Configure the plugin** (extension → Settings):
    - *Push gateway VAPID public key* → the value from step 1/2. (This alone makes
@@ -339,11 +352,13 @@ Prove a contentless push reaches the browser and wakes the service worker.
    Save it to `sub.json`. (If you don't see it, reload the extension — the SW
    subscribes on spin-up once the VAPID key is set.)
 
-2. Fire a real, did-signed wake at it with the bundled helper — it mints a
+2. Fire a real, signed wake at it with the bundled helper — it mints a
    throwaway `did:key`, registers the subscription, provisions itself onto the
-   allowlist, and sends `push/wake`, so the gateway runs its normal auth +
-   delivery (no VTA, no hand-signing). Because it registers under a throwaway
-   controller, the local gateway it targets must run in open mode
+   allowlist, and sends `push/wake`, each signed with an `authentication`
+   proof and addressed to the gateway DID the register response names, so the
+   gateway runs its normal intake + delivery (no VTA, no hand-signing). The
+   gateway needs its identity (`GATEWAY_IDENTITY_FILE`), and because the helper
+   registers under a throwaway controller it must run in open mode
    (`GATEWAY_ALLOWED_CONTROLLERS=*`) — a dev-only setting:
 
    ```sh
@@ -372,8 +387,8 @@ Prove a contentless push reaches the browser and wakes the service worker.
    cargo run -- test-wake-fcm http://127.0.0.1:8300 <fcm-registration-token>
    ```
 
-   No VTA, no `did:webvh` gateway identity, no hand-signing — the helper plays a
-   real did-signed trigger. The phone wakes, drains its mediator, and ratifies.
+   No VTA, no hand-signing — the helper plays a real signed controller and
+   trigger. The phone wakes, drains its mediator, and ratifies.
    (Uses the **sandbox** APNs host, matching a development build's token.)
 
 ### 5b. Full path — VTA-triggered

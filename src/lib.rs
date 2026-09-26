@@ -3,11 +3,11 @@
 //! wrapper; integration tests drive [`api::router`] directly.
 
 pub mod api;
-pub mod auth;
 pub mod controllers;
 pub mod didcomm;
 pub mod egress;
 pub mod identity;
+pub mod intake;
 pub mod limits;
 pub mod metrics;
 pub mod proof;

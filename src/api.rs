@@ -7,12 +7,12 @@
 //!
 //! [`dispatch_push`] takes an already-authenticated `sender` + a parsed
 //! `TrustTask` and returns the response **document** (a `…#response` or a
-//! `trust-task-error`). Each transport adapter authenticates/unpacks, calls the
-//! core, and delivers the document in its own idiom — `POST /trust-tasks`
-//! (HTTPS, did-signed) here; the DIDComm adapter (the *preferred* transport)
-//! calls the same core with the issuer the document's Data Integrity proof
-//! establishes — never with the envelope's `from` alone. The core is a
-//! function, not a worker task: request/response transports just `await`/call
+//! `trust-task-error`). No transport calls it directly: each transport adapter
+//! unpacks and hands the document to [`crate::intake`], which authenticates it
+//! by its own Data Integrity proof — the same rules on every transport — and
+//! then calls the core. The adapter delivers the response in its own idiom:
+//! `POST /trust-tasks` (HTTPS) here, DIDComm in [`crate::didcomm`]. The core is
+//! a function, not a worker task: request/response transports just `await`/call
 //! it (see the architecture note — no dedicated worker, which would bottleneck).
 
 use std::sync::Arc;
@@ -23,7 +23,7 @@ use axum::{
     extract::{DefaultBodyLimit, Request, State},
     http::{
         header::{AUTHORIZATION, CONTENT_TYPE},
-        HeaderMap, StatusCode,
+        StatusCode,
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -36,11 +36,11 @@ use serde_json::{json, Value};
 use trust_tasks_rs::{RejectReason, TrustTask};
 use uuid::Uuid;
 
-use crate::auth::{self, HEADER_DID, HEADER_SIG};
 use crate::controllers::ControllerPolicy;
 use crate::egress::EgressPolicy;
 use crate::limits::Limits;
 use crate::metrics::Metrics;
+use crate::proof::ProofVerifier;
 use crate::replay::{Admission, ReplayRecord};
 use crate::sender::{self, PushSender, SendOutcome};
 use crate::store::{ProvisionOutcome, Store, WakeAuthz};
@@ -88,6 +88,13 @@ pub struct AppState {
     pub replay: Arc<ReplayRecord>,
     /// Which controller VTAs this gateway serves ([`crate::controllers`]).
     pub controllers: Arc<ControllerPolicy>,
+    /// Verifies the Data Integrity proof a `push/provision` or `push/wake`
+    /// document carries, for every transport ([`crate::intake`]).
+    pub proofs: ProofVerifier,
+    /// This gateway's DID — what an authenticated document must name as its
+    /// `recipient`. `None` without a provisioned identity, in which case no
+    /// authenticated document is accepted (register only).
+    pub gateway_did: Option<String>,
 }
 
 /// The **public** router: the `push/*` Trust-Task endpoint and a liveness probe.
@@ -277,9 +284,9 @@ async fn complete(
 /// the authenticated caller DID (`None` if the transport authenticated no one —
 /// allowed for `push/register`). Shared by every transport adapter.
 ///
-/// "Authenticated" means proven by a signature the adapter verified — the HTTPS
-/// body signature, or the document's Data Integrity proof on DIDComm. A
-/// transport's own claim about its sender is not enough to pass here.
+/// "Authenticated" means proven by the document's own Data Integrity proof,
+/// which [`crate::intake`] verified — on every transport. A transport's own
+/// claim about its sender is not enough to pass here.
 pub(crate) async fn dispatch_push(
     state: &AppState,
     sender: Option<String>,
@@ -602,28 +609,6 @@ async fn handle_wake(
 
 // ─── HTTPS transport adapter ───────────────────────────────────────────────
 
-/// Authenticate the request if it is did-signed: verify the signature over the
-/// raw body and return the caller DID. Absent headers → `Ok(None)` (anonymous,
-/// allowed for `push/register`). A present-but-invalid signature → `Err(401)`.
-// The `Err` is a ready-to-return HTTP `Response` (short-circuit), so its size is
-// intentional — this isn't a hot-path value moved around.
-#[allow(clippy::result_large_err)]
-fn authenticate(headers: &HeaderMap, body: &Bytes) -> Result<Option<String>, Response> {
-    let did = headers.get(HEADER_DID).and_then(|v| v.to_str().ok());
-    let sig = headers.get(HEADER_SIG).and_then(|v| v.to_str().ok());
-    match (did, sig) {
-        (Some(d), Some(s)) => match auth::verify_signed(d, s, body) {
-            Ok(()) => Ok(Some(d.to_string())),
-            Err(e) => Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({ "error": "auth_failed", "message": e.to_string() })),
-            )
-                .into_response()),
-        },
-        _ => Ok(None),
-    }
-}
-
 /// Serialize a response document as an HTTP 200 JSON body — the in-band Trust
 /// Task envelope carries the outcome (success or `trust-task-error`).
 fn http_doc(value: Value) -> Response {
@@ -637,25 +622,31 @@ fn http_doc(value: Value) -> Response {
     }
 }
 
-async fn trust_tasks(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    let doc: TrustTask<Value> = match serde_json::from_slice(&body) {
+/// `POST /trust-tasks` — the HTTPS transport. The body is the Trust Task
+/// document; HTTP carries no identity of its own here, so the document is
+/// authenticated by its proof alone ([`crate::intake`]).
+async fn trust_tasks(State(state): State<AppState>, body: Bytes) -> Response {
+    let raw: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return invalid_body(e),
+    };
+    let doc: TrustTask<Value> = match serde_json::from_value(raw.clone()) {
         Ok(d) => d,
-        Err(e) => {
-            // Same reasoning as `parse`: a fixed reason out, the detail to logs.
-            tracing::debug!(error = %e, "request body is not a Trust Task document");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": "invalid_body",
-                    "message": "body is not a Trust Task document",
-                })),
-            )
-                .into_response();
-        }
+        Err(e) => return invalid_body(e),
     };
-    let sender = match authenticate(&headers, &body) {
-        Ok(s) => s,
-        Err(resp) => return resp,
-    };
-    http_doc(dispatch_push(&state, sender, &doc).await)
+    http_doc(crate::intake::receive_document(&state, None, &raw, &doc).await)
+}
+
+/// `400` for a body that is not a Trust Task document. Same reasoning as
+/// `parse`: a fixed reason out, the detail to logs.
+fn invalid_body(e: serde_json::Error) -> Response {
+    tracing::debug!(error = %e, "request body is not a Trust Task document");
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": "invalid_body",
+            "message": "body is not a Trust Task document",
+        })),
+    )
+        .into_response()
 }

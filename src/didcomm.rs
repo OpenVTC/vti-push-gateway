@@ -1,66 +1,59 @@
-//! The gateway's DIDComm transport — the **preferred** transport.
+//! The gateway's DIDComm transport adapter.
 //!
 //! Built on `affinidi-messaging-didcomm-service` (the same crate `vta-service`
 //! uses), which does the server-side work — connect to the mediator, receive,
-//! **unpack + authenticate the authcrypt sender** — and routes each message to
-//! a handler. The gateway provides its provisioned `did:webvh` identity secrets
-//! (a [`TDKProfile`]) and a [`Router`] that — like the VTA — routes the single
-//! Trust Task envelope type to a handler calling the shared [`dispatch_push`]
-//! core, which dispatches on the `push/*` `type` inside the body.
+//! unpack — and routes each message to a handler. The gateway provides its
+//! provisioned `did:webvh` identity secrets (a [`TDKProfile`]) and a [`Router`]
+//! that — like the VTA — routes the single Trust Task envelope type to a handler
+//! passing the document to [`intake::receive`], the intake every transport
+//! shares, which authenticates it by its own proof and dispatches on the
+//! `push/*` `type` inside the body.
 //!
-//! Authentication is intrinsic: the unpacked [`Message`]'s `from` is the
-//! cryptographically-authenticated sender — no `X-TT-Did` header, no hand-rolled
-//! verification (contrast the HTTPS adapter). The reply is packed back to the
-//! sender by the service.
+//! This adapter adds nothing to authorisation: the envelope's `from` is handed
+//! to the intake only as the transport's claim about its sender, which must
+//! agree with the proven issuer and never stands in for it (see
+//! [`crate::intake`]). The reply is packed back to the envelope sender by the
+//! service.
 
 use affinidi_messaging_didcomm_service::{
     handler_fn, ignore_handler, trust_ping_handler, DIDCommResponse, DIDCommService,
     DIDCommServiceConfig, DIDCommServiceError, Extension, HandlerContext, ListenerConfig,
     RestartPolicy, RetryConfig, Router, MESSAGE_PICKUP_STATUS_TYPE, TRUST_PING_TYPE,
 };
+
 use affinidi_tdk::common::profiles::TDKProfile;
 use affinidi_tdk::didcomm::Message;
-use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use trust_tasks_rs::TrustTask;
 
-use crate::api::{dispatch_push, AppState};
+use crate::api::AppState;
 use crate::identity::GatewayIdentity;
+use crate::intake;
 use crate::resolver::ResolverTuning;
 
 /// DIDComm message type wrapping a Trust Task document (the DIDComm binding's
 /// envelope). The request body and the reply both carry a Trust Task doc here.
 const TRUST_TASK_ENVELOPE_TYPE: &str = "https://trusttasks.org/binding/didcomm/0.1/envelope";
 
-/// Handler for every `push/*` type — the crate has already unpacked the message
-/// and authenticated the sender (`message.from`). The inner Trust Task doc rides
-/// in `message.body`. Calls the shared [`dispatch_push`] core; the service packs
-/// the returned response document back to the sender.
+/// Handler for every `push/*` type. The inner Trust Task doc rides in
+/// `message.body`; [`intake::receive`] authenticates it by its proof and
+/// dispatches it, and the service packs the returned response document back
+/// to the sender.
 async fn handle_push(
     _ctx: HandlerContext,
     message: Message,
     Extension(state): Extension<AppState>,
 ) -> Result<Option<DIDCommResponse>, DIDCommServiceError> {
-    let doc: TrustTask<Value> = match serde_json::from_value(message.body.clone()) {
-        Ok(d) => d,
-        Err(e) => {
-            // Not a Trust Task envelope — nothing to respond to meaningfully.
-            tracing::warn!(error = %e, from = ?message.from, "push/* body is not a Trust Task document");
-            return Ok(None);
-        }
-    };
-    // `message.from` is the authcrypt-authenticated sender (None for anoncrypt).
-    let response = dispatch_push(&state, message.from.clone(), &doc).await;
-    Ok(Some(DIDCommResponse::new(
-        TRUST_TASK_ENVELOPE_TYPE,
-        response,
-    )))
+    Ok(
+        intake::receive(&state, message.from.as_deref(), &message.body)
+            .await
+            .map(|response| DIDCommResponse::new(TRUST_TASK_ENVELOPE_TYPE, response)),
+    )
 }
 
 /// Build the router. Like the VTA, **one** DIDComm message type
 /// (`TRUST_TASK_ENVELOPE_TYPE`) carries every `push/*` `TrustTask<P>` in its
-/// body; `handle_push` → `dispatch_push` routes on the Trust Task `type` inside
-/// the body. (Plus trust-ping and a no-op for pickup-status.)
+/// body; `handle_push` → [`intake::receive`] routes on the Trust Task `type`
+/// inside the body. (Plus trust-ping and a no-op for pickup-status.)
 fn build_router(state: AppState) -> Result<Router, DIDCommServiceError> {
     Router::new()
         .extension(state)
@@ -70,8 +63,8 @@ fn build_router(state: AppState) -> Result<Router, DIDCommServiceError> {
 }
 
 /// Start the gateway's DIDComm listener: connect to the mediator as the
-/// provisioned `did:webvh` identity and route inbound `push/*` to the shared
-/// dispatch core. Returns the running service (cancel `shutdown` to stop it).
+/// provisioned `did:webvh` identity and hand inbound `push/*` to the shared
+/// intake. Returns the running service (cancel `shutdown` to stop it).
 pub async fn start(
     identity: &GatewayIdentity,
     state: AppState,

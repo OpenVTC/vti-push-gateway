@@ -3,13 +3,18 @@
 //! the app's platform push credentials, issues opaque wake handles, enforces a
 //! VTA-provisioned trigger allowlist, and relays **contentless** wakes.
 //!
-//! The control plane is the `push/*` Trust Task family, dispatched over two
-//! transports that share one core (`api::dispatch_push`):
-//! - **DIDComm** (preferred) — when `GATEWAY_IDENTITY_FILE` provides the
-//!   gateway's provisioned `did:webvh` identity, a `DIDCommService` connects to
-//!   the mediator and authenticates senders via authcrypt.
-//! - **HTTPS** — `POST /trust-tasks`, did-signed, for callers that can't speak
-//!   DIDComm.
+//! The control plane is the `push/*` Trust Task family, accepted over two
+//! transports that share one intake (`intake::receive`), so `push/provision`
+//! and `push/wake` are authorised identically on both — by the Data Integrity
+//! proof on the document, bound to its issuer, fresh, addressed to this
+//! gateway's DID, and once only:
+//! - **DIDComm** — when `GATEWAY_IDENTITY_FILE` provides the gateway's
+//!   provisioned `did:webvh` identity, a `DIDCommService` connects to the
+//!   mediator.
+//! - **HTTPS** — `POST /trust-tasks`.
+//!
+//! Without an identity the gateway has no DID to be addressed to, so it serves
+//! `push/register` only.
 //!
 //! Push *delivery* is real for Web Push (VAPID) and APNs when their credentials
 //! are configured; the dev `EchoSender` is the fallback (and FCM follows).
@@ -37,6 +42,7 @@ use vti_push_gateway::store::{Store, StoreLimits};
 const ENV_MAX_HANDLES: &str = "GATEWAY_MAX_HANDLES";
 const ENV_MAX_PER_TOKEN: &str = "GATEWAY_MAX_HANDLES_PER_TOKEN";
 const ENV_UNPROVISIONED_TTL_SECS: &str = "GATEWAY_UNPROVISIONED_TTL_SECS";
+const ENV_MAX_PER_CONTROLLER: &str = "GATEWAY_MAX_HANDLES_PER_CONTROLLER";
 /// Minimum gap between snapshot writes.
 const ENV_SNAPSHOT_FLUSH_MS: &str = "GATEWAY_SNAPSHOT_FLUSH_MS";
 
@@ -226,6 +232,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Which controller VTAs this gateway serves. A malformed list stops startup
+    // rather than being guessed at; an empty one refuses every registration.
+    let controllers = vti_push_gateway::controllers::ControllerPolicy::from_env()?;
+    match &controllers {
+        vti_push_gateway::controllers::ControllerPolicy::Open => tracing::warn!(
+            "{}=* — OPEN MODE: any controller VTA may register handles here. \
+             Per-controller, per-handle and fair-share limits still apply; \
+             list the VTAs this gateway serves instead.",
+            vti_push_gateway::controllers::ENV_ALLOWED_CONTROLLERS
+        ),
+        vti_push_gateway::controllers::ControllerPolicy::Listed(set) if set.is_empty() => {
+            tracing::error!(
+                "{} is unset or empty — every push/register will be refused. \
+                 List the controller VTA DIDs this gateway serves.",
+                vti_push_gateway::controllers::ENV_ALLOWED_CONTROLLERS
+            )
+        }
+        p => tracing::info!(controllers = %p.summary(), "controller allowlist"),
+    }
+
     // Registry bounds. `push/register` is anonymous, so these are the ceilings on
     // what an unauthenticated caller can make the gateway hold.
     let defaults = StoreLimits::default();
@@ -236,11 +262,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ENV_UNPROVISIONED_TTL_SECS,
             defaults.unprovisioned_ttl_secs,
         ),
+        max_per_controller: env_num(ENV_MAX_PER_CONTROLLER, defaults.max_per_controller),
     };
     tracing::info!(
         max_handles = store_limits.max_handles,
         max_per_token = store_limits.max_per_token,
         unprovisioned_ttl_secs = store_limits.unprovisioned_ttl_secs,
+        max_per_controller = store_limits.max_per_controller,
         "handle registry limits"
     );
 
@@ -262,6 +290,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http = ?limits.http_config(),
         "rate limits"
     );
+    // Verifies the proof on `push/provision` / `push/wake` documents, for every
+    // transport. Under the tuned resolver's host policy: the DIDs it resolves
+    // are named by inbound documents.
+    let tuning = vti_push_gateway::resolver::ResolverTuning::from_env();
+    let proofs = vti_push_gateway::proof::ProofVerifier::new(Arc::new(
+        affinidi_did_resolver_cache_sdk::DIDCacheClient::new(tuning.did_cache_config())
+            .await
+            .map_err(|e| format!("build proof DID resolver: {e}"))?,
+    ));
+    if identity.is_none() {
+        tracing::warn!(
+            "no GATEWAY_IDENTITY_FILE — the gateway has no DID for a document to be \
+             addressed to, so push/provision and push/wake are refused on every transport"
+        );
+    }
     let state = AppState {
         store: store.clone(),
         senders: Arc::new(senders),
@@ -269,6 +312,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
         egress,
         limits: limits.clone(),
+        replay: Arc::new(vti_push_gateway::replay::ReplayRecord::default()),
+        controllers: Arc::new(controllers),
+        proofs,
+        gateway_did: identity.as_ref().map(|id| id.did.clone()),
     };
 
     // Start the DIDComm listener (preferred transport) if provisioned.
@@ -431,30 +478,26 @@ fn vapid_keygen(path: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `test-wake <gateway-url> <subscription.json> [mediator-did]` — fire a real
-/// contentless wake at a registered subscription, end to end, with no VTA in the
-/// loop. Acts as a **legitimate did-signed trigger** (not a backdoor): it mints a
-/// throwaway `did:key`, `push/register`s the subscription under that DID (so it's
-/// the controller), `push/provision`s itself onto the allowlist, then sends a
-/// signed `push/wake`. The gateway runs its normal auth + allowlist + delivery.
+/// Shared core for the `test-wake*` helpers: fire a real contentless wake at a
+/// registered subscription, end to end, with no VTA in the loop. Acts as a
+/// **legitimate signed caller** (not a backdoor): it mints a throwaway
+/// `did:key`, `push/register`s the registration under that DID (so it's the
+/// controller), `push/provision`s itself onto the allowlist, then sends a
+/// signed `push/wake`. The gateway runs its normal intake — proof, freshness,
+/// replay, allowlist — and delivery.
 ///
-/// `subscription.json` is the extension service-worker's logged subscription —
-/// `{ "endpoint": …, "keys": { "p256dh": …, "auth": … } }` (copy the
-/// `[pnm push] subscription:` line). Use it to prove: wake → gateway → Web Push
-/// → the browser SW wakes and drains. The gateway validates the registration
-/// like any other: the endpoint must be an https URL on an allowed push service
-/// host (`GATEWAY_WEBPUSH_ALLOWED_HOSTS`), so a real browser subscription works
-/// and a local or internal URL is refused.
-/// Shared core for the `test-wake*` helpers. Mints a throwaway `did:key`,
-/// registers the given platform `registration` under it (so it's the
-/// controller), provisions itself onto the allowlist, then fires a signed
-/// `push/wake`. Exercises the real gateway auth + allowlist + delivery path —
-/// no VTA, no hand-signing.
+/// The provision and wake are addressed to the gateway DID the register
+/// response names, so the gateway must have a provisioned identity; and the
+/// throwaway DID is a controller only a gateway in open mode
+/// (`GATEWAY_ALLOWED_CONTROLLERS=*`) serves.
 async fn fire_wake(
     gateway: &str,
     registration: serde_json::Value,
     mediator: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+    use affinidi_secrets_resolver::secrets::Secret;
+
     // A throwaway did:key acting as both controller VTA (to provision) and
     // trigger (to wake) — a real signed caller, not a backdoor.
     let mut seed = [0u8; 32];
@@ -462,34 +505,30 @@ async fn fire_wake(
         use rand::Rng;
         rand::rng().fill_bytes(&mut seed);
     }
-    let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-    let did = {
+    let probe = Secret::generate_ed25519(None, Some(&seed));
+    let mb = {
         let mut b = vec![0xed, 0x01];
-        b.extend_from_slice(sk.verifying_key().as_bytes());
-        format!("did:key:z{}", bs58::encode(b).into_string())
+        b.extend_from_slice(probe.get_public_bytes());
+        format!("z{}", bs58::encode(b).into_string())
     };
+    let did = format!("did:key:{mb}");
+    let secret = Secret::generate_ed25519(Some(&format!("{did}#{mb}")), Some(&seed));
 
     let url = format!("{}/trust-tasks", gateway.trim_end_matches('/'));
     let client = reqwest::Client::new();
 
-    // POST a Trust Task doc; sign the exact body bytes when `signer` is set (the
-    // gateway verifies the X-TT-Signature over the raw body).
+    // POST a Trust Task doc; the gateway authenticates it by its own proof.
     async fn post(
         client: &reqwest::Client,
         url: &str,
         doc: &serde_json::Value,
-        signer: Option<(&str, &ed25519_dalek::SigningKey)>,
     ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-        use base64::Engine;
-        use ed25519_dalek::Signer;
-        let body = serde_json::to_vec(doc)?;
-        let mut req = client.post(url).header("content-type", "application/json");
-        if let Some((did, sk)) = signer {
-            let sig =
-                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.sign(&body).to_bytes());
-            req = req.header("x-tt-did", did).header("x-tt-signature", sig);
-        }
-        let resp = req.body(body).send().await?;
+        let resp = client
+            .post(url)
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(doc)?)
+            .send()
+            .await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
@@ -505,27 +544,62 @@ async fn fire_wake(
         Ok(v)
     }
 
-    // 1. register (unauthenticated) → opaque handle.
+    // A document issued by the throwaway DID to `recipient`, signed for
+    // `authentication` the way a VTA signs its own operational messages.
+    let signed = |type_uri: &str, recipient: &str, payload: serde_json::Value| {
+        let mut doc = serde_json::json!({
+            "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
+            "type": type_uri,
+            "issuer": did,
+            "recipient": recipient,
+            "issuedAt": chrono::Utc::now().to_rfc3339(),
+            "payload": payload,
+        });
+        let secret = &secret;
+        async move {
+            let proof = DataIntegrityProof::sign(
+                &doc,
+                secret,
+                SignOptions::new().with_proof_purpose("authentication"),
+            )
+            .await
+            .map_err(|e| format!("sign: {e}"))?;
+            doc["proof"] = serde_json::to_value(&proof)?;
+            Ok::<_, Box<dyn std::error::Error>>(doc)
+        }
+    };
+
+    // 1. register (unauthenticated) → opaque handle, and the gateway's DID.
     let reg = serde_json::json!({
         "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
         "type": "https://trusttasks.org/spec/push/register/0.2",
         "payload": { "registration": registration, "controllerVtaDid": did }
     });
-    let handle = post(&client, &url, &reg, None)
-        .await?
+    let resp = post(&client, &url, &reg).await?;
+    let handle = resp
         .pointer("/payload/wakeHandle/handle")
         .and_then(|v| v.as_str())
         .ok_or("register: no handle in response")?
         .to_string();
-    println!("1/3 registered → handle {handle}");
+    let gateway_did = resp
+        .pointer("/payload/wakeHandle/gateway")
+        .and_then(|v| v.as_str())
+        .filter(|g| g.starts_with("did:"))
+        .ok_or(
+            "register: the gateway names no DID — it has no provisioned identity, \
+             so it accepts no signed provision or wake",
+        )?
+        .to_string();
+    println!("1/3 registered → handle {handle} at {gateway_did}");
 
     // 2. provision (signed; we are the controller) → allowlist = [self].
-    let prov = serde_json::json!({
-        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        "type": "https://trusttasks.org/spec/push/provision/0.2",
-        "payload": { "handle": handle, "policy": { "allowedTriggers": [did] } }
-    });
-    post(&client, &url, &prov, Some((&did, &sk))).await?;
+    let prov = signed(
+        "https://trusttasks.org/spec/push/provision/0.2",
+        &gateway_did,
+        serde_json::json!({ "handle": handle, "policy": { "allowedTriggers": [did] } }),
+    )
+    .await?;
+    post(&client, &url, &prov).await?;
     println!("2/3 provisioned → allowlist [self]");
 
     // 3. wake (signed; we are on the allowlist) → contentless push.
@@ -534,12 +608,13 @@ async fn fire_wake(
     if let Some(m) = &mediator {
         wake_payload["mediator"] = serde_json::json!(m);
     }
-    let wake = serde_json::json!({
-        "id": format!("urn:uuid:{}", uuid::Uuid::new_v4()),
-        "type": "https://trusttasks.org/spec/push/wake/0.2",
-        "payload": wake_payload
-    });
-    let resp = post(&client, &url, &wake, Some((&did, &sk))).await?;
+    let wake = signed(
+        "https://trusttasks.org/spec/push/wake/0.2",
+        &gateway_did,
+        wake_payload,
+    )
+    .await?;
+    let resp = post(&client, &url, &wake).await?;
     let status = resp
         .pointer("/payload/status")
         .and_then(|v| v.as_str())

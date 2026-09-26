@@ -1,14 +1,18 @@
-//! End-to-end exercise of the gateway's `push/*` Trust-Task dispatcher:
-//! register → provision → wake, plus the auth/allowlist refusals. Posts
-//! `TrustTask` documents to `/trust-tasks` and inspects the response document.
+//! End-to-end exercise of the gateway's `push/*` Trust-Task dispatcher over
+//! HTTPS: register → provision → wake, plus the auth/allowlist refusals. Posts
+//! `TrustTask` documents to `/trust-tasks` — provisions and wakes signed with
+//! the document's own Data Integrity proof — and inspects the response
+//! document. `document_auth.rs` covers the proof rules on every transport.
 
 use std::sync::Arc;
 
+use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
+use affinidi_did_resolver_cache_sdk::{config::DIDCacheConfigBuilder, DIDCacheClient};
+use affinidi_secrets_resolver::secrets::Secret;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
-use base64::Engine;
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt;
 use rand::Rng;
 use serde_json::{json, Value};
@@ -17,11 +21,13 @@ use tower::ServiceExt;
 use vti_push_gateway::api::{metrics_router, router, AppState, DEFAULT_METRICS_BIND};
 use vti_push_gateway::egress::EgressPolicy;
 use vti_push_gateway::limits::{Limits, RateConfig, DEFAULT_HTTP, DEFAULT_PER_DID};
+use vti_push_gateway::proof::ProofVerifier;
 use vti_push_gateway::sender::{generate_vapid_keypair, EchoSender, PushSender, SendOutcome};
 use vti_push_gateway::store::{Store, StoreLimits};
 use vti_push_gateway::types::{PushRegistration, WakeTriggerPolicy, WebPushKeys};
 
 const ED25519_MULTICODEC: [u8; 2] = [0xed, 0x01];
+const GATEWAY_DID: &str = "did:webvh:scid:gateway.example";
 const PUSH_REGISTER: &str = "https://trusttasks.org/spec/push/register/0.2";
 const PUSH_PROVISION: &str = "https://trusttasks.org/spec/push/provision/0.2";
 const PUSH_WAKE: &str = "https://trusttasks.org/spec/push/wake/0.2";
@@ -44,14 +50,14 @@ fn did_key_for(sk: &SigningKey) -> String {
     format!("did:key:z{}", bs58::encode(bytes).into_string())
 }
 
-fn state() -> AppState {
+async fn state() -> AppState {
     // Permissive limits by default: these tests exercise the push/* logic, and a
     // rate limit tripping mid-test would be a confusing failure. The tests that
     // are *about* the limits set their own.
-    state_with(Store::new(), Limits::permissive())
+    state_with(Store::new(), Limits::permissive()).await
 }
 
-fn state_with(store: Store, limits: Limits) -> AppState {
+async fn state_with(store: Store, limits: Limits) -> AppState {
     let senders: Vec<Box<dyn PushSender>> = vec![Box::new(EchoSender)];
     AppState {
         store: Arc::new(store),
@@ -60,6 +66,16 @@ fn state_with(store: Store, limits: Limits) -> AppState {
         metrics: Arc::new(vti_push_gateway::metrics::Metrics::default()),
         egress: Arc::new(EgressPolicy::default()),
         limits: Arc::new(limits),
+        replay: Arc::new(vti_push_gateway::replay::ReplayRecord::default()),
+        // These suites mint a fresh controller per test; the allowlist has
+        // its own tests.
+        controllers: Arc::new(vti_push_gateway::controllers::ControllerPolicy::Open),
+        proofs: ProofVerifier::new(Arc::new(
+            DIDCacheClient::new(DIDCacheConfigBuilder::default().build())
+                .await
+                .expect("resolver"),
+        )),
+        gateway_did: Some(GATEWAY_DID.into()),
     }
 }
 
@@ -72,8 +88,8 @@ fn apns_registration(n: usize) -> Value {
 /// The public router plus a management router sharing one `AppState`, so a test
 /// can drive `push/*` and then scrape the counters those calls bumped. `/metrics`
 /// no longer lives on the public router.
-fn routers() -> (Router, Router) {
-    let st = state();
+async fn routers() -> (Router, Router) {
+    let st = state().await;
     (router(st.clone()), metrics_router(st, None))
 }
 
@@ -117,22 +133,42 @@ fn tt_doc(type_uri: &str, payload: Value) -> Value {
     json!({ "id": "urn:uuid:req", "type": type_uri, "payload": payload })
 }
 
-/// POST a Trust Task document to `/trust-tasks`, optionally did-signed over the
-/// exact body bytes.
-fn post(doc: &Value, signer: Option<&SigningKey>) -> Request<Body> {
-    let bytes = serde_json::to_vec(doc).unwrap();
-    let mut b = Request::builder()
+/// `doc` as issued by `sk`'s did:key to this gateway: a fresh `id`, `issuedAt`
+/// now, and an `authentication` Data Integrity proof — the way a VTA signs its
+/// own operational documents.
+async fn signed(doc: &Value, sk: &SigningKey) -> Value {
+    let did = did_key_for(sk);
+    let mb = did.strip_prefix("did:key:").unwrap();
+    let secret = Secret::generate_ed25519(Some(&format!("{did}#{mb}")), Some(&sk.to_bytes()));
+    let mut doc = doc.clone();
+    doc["id"] = json!(format!("urn:uuid:{}", uuid::Uuid::new_v4()));
+    doc["issuer"] = json!(did);
+    doc["recipient"] = json!(GATEWAY_DID);
+    doc["issuedAt"] = json!(chrono::Utc::now().to_rfc3339());
+    let proof = DataIntegrityProof::sign(
+        &doc,
+        &secret,
+        SignOptions::new().with_proof_purpose("authentication"),
+    )
+    .await
+    .expect("signs");
+    doc["proof"] = serde_json::to_value(&proof).unwrap();
+    doc
+}
+
+/// POST a Trust Task document to `/trust-tasks`, signed by `signer` (see
+/// [`signed`]) when given.
+async fn post(doc: &Value, signer: Option<&SigningKey>) -> Request<Body> {
+    let doc = match signer {
+        Some(sk) => signed(doc, sk).await,
+        None => doc.clone(),
+    };
+    Request::builder()
         .method("POST")
         .uri("/trust-tasks")
-        .header("content-type", "application/json");
-    if let Some(sk) = signer {
-        let sig =
-            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sk.sign(&bytes).to_bytes());
-        b = b
-            .header("x-tt-did", did_key_for(sk))
-            .header("x-tt-signature", sig);
-    }
-    b.body(Body::from(bytes)).unwrap()
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&doc).unwrap()))
+        .unwrap()
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
@@ -152,7 +188,7 @@ fn is_success(doc: &Value) -> bool {
 async fn full_flow_register_provision_wake() {
     let vta = signing_key();
     let mediator = signing_key();
-    let app = router(state());
+    let app = router(state().await);
 
     // 1. Device registers (unauthenticated) → opaque handle.
     let reg = tt_doc(
@@ -162,7 +198,7 @@ async fn full_flow_register_provision_wake() {
             "controllerVtaDid": did_key_for(&vta),
         }),
     );
-    let resp = app.clone().oneshot(post(&reg, None)).await.unwrap();
+    let resp = app.clone().oneshot(post(&reg, None).await).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let doc = body_json(resp).await;
     assert!(is_success(&doc), "register should succeed: {doc}");
@@ -175,7 +211,7 @@ async fn full_flow_register_provision_wake() {
     let wake = tt_doc(PUSH_WAKE, json!({ "handle": handle, "v": 1 }));
     let doc = body_json(
         app.clone()
-            .oneshot(post(&wake, Some(&mediator)))
+            .oneshot(post(&wake, Some(&mediator)).await)
             .await
             .unwrap(),
     )
@@ -193,7 +229,7 @@ async fn full_flow_register_provision_wake() {
     );
     let doc = body_json(
         app.clone()
-            .oneshot(post(&prov, Some(&imposter)))
+            .oneshot(post(&prov, Some(&imposter)).await)
             .await
             .unwrap(),
     )
@@ -208,7 +244,13 @@ async fn full_flow_register_provision_wake() {
         PUSH_PROVISION,
         json!({ "handle": handle, "policy": { "allowedTriggers": [did_key_for(&mediator)] } }),
     );
-    let doc = body_json(app.clone().oneshot(post(&prov, Some(&vta))).await.unwrap()).await;
+    let doc = body_json(
+        app.clone()
+            .oneshot(post(&prov, Some(&vta)).await)
+            .await
+            .unwrap(),
+    )
+    .await;
     assert!(
         is_success(&doc),
         "controller provision should succeed: {doc}"
@@ -221,7 +263,7 @@ async fn full_flow_register_provision_wake() {
     );
     let doc = body_json(
         app.clone()
-            .oneshot(post(&wake, Some(&mediator)))
+            .oneshot(post(&wake, Some(&mediator)).await)
             .await
             .unwrap(),
     )
@@ -232,7 +274,7 @@ async fn full_flow_register_provision_wake() {
     // 6. A DID not on the allowlist still can't wake it.
     let doc = body_json(
         app.clone()
-            .oneshot(post(&wake, Some(&imposter)))
+            .oneshot(post(&wake, Some(&imposter)).await)
             .await
             .unwrap(),
     )
@@ -248,7 +290,7 @@ async fn full_flow_register_provision_wake() {
 #[tokio::test]
 async fn register_v2_returns_v2_response() {
     let vta = signing_key();
-    let app = router(state());
+    let app = router(state().await);
     let reg = tt_doc(
         PUSH_REGISTER,
         json!({
@@ -256,7 +298,7 @@ async fn register_v2_returns_v2_response() {
             "controllerVtaDid": did_key_for(&vta),
         }),
     );
-    let resp = app.oneshot(post(&reg, None)).await.unwrap();
+    let resp = app.oneshot(post(&reg, None).await).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let doc = body_json(resp).await;
     assert!(is_success(&doc), "register/0.2 should succeed: {doc}");
@@ -276,7 +318,7 @@ async fn register_v2_returns_v2_response() {
 #[tokio::test]
 async fn v0_1_uris_are_rejected() {
     let vta = signing_key();
-    let app = router(state());
+    let app = router(state().await);
     let docs = [
         tt_doc(
             PUSH_REGISTER_V1,
@@ -292,7 +334,13 @@ async fn v0_1_uris_are_rejected() {
         tt_doc(PUSH_WAKE_V1, json!({ "handle": "h", "v": 1 })),
     ];
     for req in &docs {
-        let doc = body_json(app.clone().oneshot(post(req, Some(&vta))).await.unwrap()).await;
+        let doc = body_json(
+            app.clone()
+                .oneshot(post(req, Some(&vta)).await)
+                .await
+                .unwrap(),
+        )
+        .await;
         assert!(
             !is_success(&doc),
             "retired 0.1 URI {} must be rejected: {doc}",
@@ -325,7 +373,7 @@ async fn dead_token_reports_v2_token_unregistered_status() {
     let vta = signing_key();
     let mediator = signing_key();
     let senders: Vec<Box<dyn PushSender>> = vec![Box::new(DeadTokenSender)];
-    let mut st = state();
+    let mut st = state().await;
     st.senders = Arc::new(senders);
     let app = router(st);
 
@@ -336,8 +384,8 @@ async fn dead_token_reports_v2_token_unregistered_status() {
             "controllerVtaDid": did_key_for(&vta),
         }),
     );
-    let handle = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await["payload"]
-        ["wakeHandle"]["handle"]
+    let handle = body_json(app.clone().oneshot(post(&reg, None).await).await.unwrap()).await
+        ["payload"]["wakeHandle"]["handle"]
         .as_str()
         .unwrap()
         .to_string();
@@ -345,13 +393,19 @@ async fn dead_token_reports_v2_token_unregistered_status() {
         PUSH_PROVISION,
         json!({ "handle": handle, "policy": { "allowedTriggers": [did_key_for(&mediator)] } }),
     );
-    let doc = body_json(app.clone().oneshot(post(&prov, Some(&vta))).await.unwrap()).await;
+    let doc = body_json(
+        app.clone()
+            .oneshot(post(&prov, Some(&vta)).await)
+            .await
+            .unwrap(),
+    )
+    .await;
     assert!(is_success(&doc), "provision should succeed: {doc}");
 
     let wake = tt_doc(PUSH_WAKE, json!({ "handle": handle, "v": 1 }));
     let doc = body_json(
         app.clone()
-            .oneshot(post(&wake, Some(&mediator)))
+            .oneshot(post(&wake, Some(&mediator)).await)
             .await
             .unwrap(),
     )
@@ -363,7 +417,12 @@ async fn dead_token_reports_v2_token_unregistered_status() {
     );
 
     // The handle was dropped — a second wake finds it unknown.
-    let doc = body_json(app.oneshot(post(&wake, Some(&mediator))).await.unwrap()).await;
+    let doc = body_json(
+        app.oneshot(post(&wake, Some(&mediator)).await)
+            .await
+            .unwrap(),
+    )
+    .await;
     assert!(!is_success(&doc), "dropped handle must be unknown: {doc}");
 }
 
@@ -375,7 +434,7 @@ async fn dead_token_reports_v2_token_unregistered_status() {
 async fn metrics_endpoint_reflects_operations() {
     let vta = signing_key();
     let mediator = signing_key();
-    let (app, metrics_app) = routers();
+    let (app, metrics_app) = routers().await;
 
     // register → handle.
     let reg = tt_doc(
@@ -385,8 +444,8 @@ async fn metrics_endpoint_reflects_operations() {
             "controllerVtaDid": did_key_for(&vta),
         }),
     );
-    let handle = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await["payload"]
-        ["wakeHandle"]["handle"]
+    let handle = body_json(app.clone().oneshot(post(&reg, None).await).await.unwrap()).await
+        ["payload"]["wakeHandle"]["handle"]
         .as_str()
         .unwrap()
         .to_string();
@@ -396,17 +455,20 @@ async fn metrics_endpoint_reflects_operations() {
         PUSH_PROVISION,
         json!({ "handle": handle, "policy": { "allowedTriggers": [did_key_for(&mediator)] } }),
     );
-    app.clone().oneshot(post(&prov, Some(&vta))).await.unwrap();
+    app.clone()
+        .oneshot(post(&prov, Some(&vta)).await)
+        .await
+        .unwrap();
     let wake = tt_doc(PUSH_WAKE, json!({ "handle": handle, "v": 1 }));
     app.clone()
-        .oneshot(post(&wake, Some(&mediator)))
+        .oneshot(post(&wake, Some(&mediator)).await)
         .await
         .unwrap();
 
     // a wake from a non-allowlisted trigger → not_allowed.
     let imposter = signing_key();
     app.clone()
-        .oneshot(post(&wake, Some(&imposter)))
+        .oneshot(post(&wake, Some(&imposter)).await)
         .await
         .unwrap();
 
@@ -431,21 +493,26 @@ async fn metrics_endpoint_reflects_operations() {
 #[tokio::test]
 async fn wake_unknown_handle_is_rejected() {
     let trigger = signing_key();
-    let app = router(state());
+    let app = router(state().await);
     let wake = tt_doc(PUSH_WAKE, json!({ "handle": "nope", "v": 1 }));
-    let doc = body_json(app.oneshot(post(&wake, Some(&trigger))).await.unwrap()).await;
+    let doc = body_json(
+        app.oneshot(post(&wake, Some(&trigger)).await)
+            .await
+            .unwrap(),
+    )
+    .await;
     assert!(!is_success(&doc), "unknown handle must be rejected: {doc}");
 }
 
 #[tokio::test]
 async fn provision_without_auth_is_rejected() {
-    let app = router(state());
+    let app = router(state().await);
     // No signature → no authenticated caller → provision refused.
     let prov = tt_doc(
         PUSH_PROVISION,
         json!({ "handle": "h", "policy": { "allowedTriggers": [] } }),
     );
-    let doc = body_json(app.oneshot(post(&prov, None)).await.unwrap()).await;
+    let doc = body_json(app.oneshot(post(&prov, None).await).await.unwrap()).await;
     assert!(
         !is_success(&doc),
         "unauthenticated provision must be rejected: {doc}"
@@ -457,7 +524,7 @@ async fn provision_without_auth_is_rejected() {
 /// nothing is registered (`gateway_register_total` stays 0).
 #[tokio::test]
 async fn register_ssrf_webpush_endpoint_is_rejected() {
-    let (app, metrics_app) = routers();
+    let (app, metrics_app) = routers().await;
     // The exact endpoint from pocs/.../sub-ssrf.json (with the payload's own keys).
     let reg = tt_doc(
         PUSH_REGISTER,
@@ -473,7 +540,7 @@ async fn register_ssrf_webpush_endpoint_is_rejected() {
             "controllerVtaDid": did_key_for(&signing_key()),
         }),
     );
-    let resp = app.clone().oneshot(post(&reg, None)).await.unwrap();
+    let resp = app.clone().oneshot(post(&reg, None).await).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let doc = body_json(resp).await;
     assert!(
@@ -505,13 +572,13 @@ async fn register_rejects_invalid_fields() {
         json!({ "platform": "apns", "token": "../x", "topic": "org.openvtc.app" }),
     ];
     for reg in bad_regs {
-        let (app, metrics_app) = routers();
+        let (app, metrics_app) = routers().await;
         let reg_is = reg.clone();
         let doc = tt_doc(
             PUSH_REGISTER,
             json!({ "registration": reg, "controllerVtaDid": did_key_for(&signing_key()) }),
         );
-        let out = body_json(app.clone().oneshot(post(&doc, None)).await.unwrap()).await;
+        let out = body_json(app.clone().oneshot(post(&doc, None).await).await.unwrap()).await;
         assert!(!is_success(&out), "must be rejected: {reg_is} → {out}");
         assert!(metrics_text(&metrics_app)
             .await
@@ -519,7 +586,7 @@ async fn register_rejects_invalid_fields() {
     }
 
     // A controllerVtaDid that is not a DID is refused even with a valid endpoint.
-    let app = router(state());
+    let app = router(state().await);
     let doc = tt_doc(
         PUSH_REGISTER,
         json!({
@@ -528,7 +595,7 @@ async fn register_rejects_invalid_fields() {
             "controllerVtaDid": "not-a-did",
         }),
     );
-    let out = body_json(app.oneshot(post(&doc, None)).await.unwrap()).await;
+    let out = body_json(app.oneshot(post(&doc, None).await).await.unwrap()).await;
     assert!(
         !is_success(&out),
         "bad controller DID must be rejected: {out}"
@@ -539,7 +606,7 @@ async fn register_rejects_invalid_fields() {
 #[tokio::test]
 async fn register_accepts_valid_webpush() {
     let senders: Vec<Box<dyn PushSender>> = vec![Box::new(EchoSender)];
-    let mut st = state();
+    let mut st = state().await;
     st.senders = Arc::new(senders);
     let app = router(st);
     let reg = tt_doc(
@@ -551,7 +618,7 @@ async fn register_accepts_valid_webpush() {
             "controllerVtaDid": did_key_for(&signing_key()),
         }),
     );
-    let doc = body_json(app.oneshot(post(&reg, None)).await.unwrap()).await;
+    let doc = body_json(app.oneshot(post(&reg, None).await).await.unwrap()).await;
     assert!(
         is_success(&doc),
         "valid webpush register should succeed: {doc}"
@@ -561,7 +628,7 @@ async fn register_accepts_valid_webpush() {
 /// The 16 KiB body limit rejects an oversized `POST /trust-tasks`.
 #[tokio::test]
 async fn oversized_body_is_rejected() {
-    let app = router(state());
+    let app = router(state().await);
     let big = "a".repeat(17 * 1024);
     let reg = tt_doc(
         PUSH_REGISTER,
@@ -570,7 +637,7 @@ async fn oversized_body_is_rejected() {
             "controllerVtaDid": did_key_for(&signing_key()),
         }),
     );
-    let status = app.oneshot(post(&reg, None)).await.unwrap().status();
+    let status = app.oneshot(post(&reg, None).await).await.unwrap().status();
     assert_eq!(
         status,
         StatusCode::PAYLOAD_TOO_LARGE,
@@ -583,7 +650,7 @@ async fn oversized_body_is_rejected() {
 /// them. Liveness stays available on both.
 #[tokio::test]
 async fn metrics_is_not_served_on_the_public_router() {
-    let (app, metrics_app) = routers();
+    let (app, metrics_app) = routers().await;
     let get = |uri: &str| {
         Request::builder()
             .method("GET")
@@ -612,7 +679,7 @@ async fn metrics_is_not_served_on_the_public_router() {
 /// exact bearer token — for when the management port must be reachable off-host.
 #[tokio::test]
 async fn metrics_router_enforces_its_bearer_token() {
-    let app = metrics_router(state(), Some("s3cret".into()));
+    let app = metrics_router(state().await, Some("s3cret".into()));
     let scrape = |auth: Option<&str>| {
         let mut b = Request::builder().method("GET").uri("/metrics");
         if let Some(a) = auth {
@@ -651,7 +718,7 @@ async fn metrics_router_enforces_its_bearer_token() {
 async fn provision_bounds_the_allowed_triggers_list() {
     let vta = signing_key();
     let mediator = signing_key();
-    let app = router(state());
+    let app = router(state().await);
 
     let reg = tt_doc(
         PUSH_REGISTER,
@@ -660,8 +727,8 @@ async fn provision_bounds_the_allowed_triggers_list() {
             "controllerVtaDid": did_key_for(&vta),
         }),
     );
-    let handle = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await["payload"]
-        ["wakeHandle"]["handle"]
+    let handle = body_json(app.clone().oneshot(post(&reg, None).await).await.unwrap()).await
+        ["payload"]["wakeHandle"]["handle"]
         .as_str()
         .unwrap()
         .to_string();
@@ -672,7 +739,13 @@ async fn provision_bounds_the_allowed_triggers_list() {
         json!({ "handle": handle, "policy": { "allowedTriggers": [did_key_for(&mediator)] } }),
     );
     assert!(is_success(
-        &body_json(app.clone().oneshot(post(&good, Some(&vta))).await.unwrap()).await
+        &body_json(
+            app.clone()
+                .oneshot(post(&good, Some(&vta)).await)
+                .await
+                .unwrap()
+        )
+        .await
     ));
 
     // 33 entries → refused.
@@ -683,7 +756,7 @@ async fn provision_bounds_the_allowed_triggers_list() {
     );
     let out = body_json(
         app.clone()
-            .oneshot(post(&too_many, Some(&vta)))
+            .oneshot(post(&too_many, Some(&vta)).await)
             .await
             .unwrap(),
     )
@@ -695,7 +768,13 @@ async fn provision_bounds_the_allowed_triggers_list() {
         PUSH_PROVISION,
         json!({ "handle": handle, "policy": { "allowedTriggers": ["not-a-did"] } }),
     );
-    let out = body_json(app.clone().oneshot(post(&junk, Some(&vta))).await.unwrap()).await;
+    let out = body_json(
+        app.clone()
+            .oneshot(post(&junk, Some(&vta)).await)
+            .await
+            .unwrap(),
+    )
+    .await;
     assert!(
         !is_success(&out),
         "a non-DID trigger must be refused: {out}"
@@ -705,7 +784,7 @@ async fn provision_bounds_the_allowed_triggers_list() {
     let wake = tt_doc(PUSH_WAKE, json!({ "handle": handle, "v": 1 }));
     let out = body_json(
         app.clone()
-            .oneshot(post(&wake, Some(&mediator)))
+            .oneshot(post(&wake, Some(&mediator)).await)
             .await
             .unwrap(),
     )
@@ -723,7 +802,7 @@ async fn provision_bounds_the_allowed_triggers_list() {
     );
     let out = body_json(
         app.clone()
-            .oneshot(post(&at_cap, Some(&vta)))
+            .oneshot(post(&at_cap, Some(&vta)).await)
             .await
             .unwrap(),
     )
@@ -737,7 +816,7 @@ async fn provision_bounds_the_allowed_triggers_list() {
         PUSH_PROVISION,
         json!({ "handle": handle, "policy": { "allowedTriggers": [&a, &b, &a] } }),
     );
-    let out = body_json(app.oneshot(post(&dupes, Some(&vta))).await.unwrap()).await;
+    let out = body_json(app.oneshot(post(&dupes, Some(&vta)).await).await.unwrap()).await;
     assert!(
         is_success(&out),
         "duplicates are collapsed, not refused: {out}"
@@ -753,7 +832,7 @@ async fn provision_bounds_the_allowed_triggers_list() {
 /// serde detail goes to a debug log, not to the caller.
 #[tokio::test]
 async fn schema_mismatch_reason_is_generic() {
-    let app = router(state());
+    let app = router(state().await);
     // `endpoint` is a number where a string belongs (RUN.md #7).
     let reg = tt_doc(
         PUSH_REGISTER,
@@ -763,7 +842,7 @@ async fn schema_mismatch_reason_is_generic() {
             "controllerVtaDid": did_key_for(&signing_key()),
         }),
     );
-    let out = body_json(app.oneshot(post(&reg, None)).await.unwrap()).await;
+    let out = body_json(app.oneshot(post(&reg, None).await).await.unwrap()).await;
     assert!(!is_success(&out), "must be rejected: {out}");
 
     let text = out.to_string();
@@ -779,20 +858,42 @@ async fn schema_mismatch_reason_is_generic() {
     }
 }
 
+/// A signed document edited after signing does not verify: the answer is an
+/// in-band `proofInvalid`, not an HTTP status, as on every transport.
 #[tokio::test]
-async fn bad_signature_is_401() {
+async fn tampered_signed_document_is_refused() {
     let trigger = signing_key();
-    let app = router(state());
+    let app = router(state().await);
     let wake = tt_doc(PUSH_WAKE, json!({ "handle": "h", "v": 1 }));
-    let mut req = post(&wake, Some(&trigger));
-    // Replace the body after signing → signature no longer matches.
-    *req.body_mut() = Body::from(
-        r#"{"id":"urn:uuid:req","type":"https://trusttasks.org/spec/push/wake/0.2","payload":{"handle":"tampered","v":1}}"#,
+    let mut doc = signed(&wake, &trigger).await;
+    doc["payload"]["handle"] = json!("tampered");
+    let resp = app.oneshot(post(&doc, None).await).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let out = body_json(resp).await;
+    assert_eq!(out["payload"]["code"], "proofInvalid", "{out}");
+}
+
+/// Headers claiming a caller authorise nothing: the retired `X-TT-Did` /
+/// `X-TT-Signature` pair is ignored, so a correctly header-signed but
+/// unproven document is anonymous and refused.
+#[tokio::test]
+async fn header_identity_authorises_nothing() {
+    let vta = signing_key();
+    let app = router(state().await);
+    let prov = tt_doc(
+        PUSH_PROVISION,
+        json!({ "handle": "h", "policy": { "allowedTriggers": [] } }),
     );
-    assert_eq!(
-        app.oneshot(req).await.unwrap().status(),
-        StatusCode::UNAUTHORIZED
-    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/trust-tasks")
+        .header("content-type", "application/json")
+        .header("x-tt-did", did_key_for(&vta))
+        .header("x-tt-signature", "AAAA")
+        .body(Body::from(serde_json::to_vec(&prov).unwrap()))
+        .unwrap();
+    let out = body_json(app.oneshot(req).await.unwrap()).await;
+    assert_eq!(out["payload"]["code"], "proofRequired", "{out}");
 }
 
 /// A register budget loose enough not to interfere with tests about other
@@ -822,7 +923,8 @@ async fn register_flood_is_refused_after_the_burst() {
             DEFAULT_PER_DID,
             DEFAULT_HTTP,
         ),
-    );
+    )
+    .await;
     let app = router(st.clone());
     let metrics_app = metrics_router(st, None);
 
@@ -835,7 +937,7 @@ async fn register_flood_is_refused_after_the_burst() {
                 "controllerVtaDid": did_key_for(&signing_key()),
             }),
         );
-        let out = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await;
+        let out = body_json(app.clone().oneshot(post(&reg, None).await).await.unwrap()).await;
         if is_success(&out) {
             accepted += 1;
         }
@@ -859,17 +961,20 @@ async fn wake_budget_is_per_caller_did() {
     let vta = signing_key();
     let noisy = signing_key();
     let quiet = signing_key();
-    let app = router(state_with(
-        Store::new(),
-        Limits::new(
-            DEFAULT_REGISTER_FOR_TEST,
-            RateConfig {
-                per_second: 1,
-                burst: 3,
-            },
-            DEFAULT_HTTP,
-        ),
-    ));
+    let app = router(
+        state_with(
+            Store::new(),
+            Limits::new(
+                DEFAULT_REGISTER_FOR_TEST,
+                RateConfig {
+                    per_second: 1,
+                    burst: 3,
+                },
+                DEFAULT_HTTP,
+            ),
+        )
+        .await,
+    );
 
     // Register and provision both triggers onto one handle.
     let reg = tt_doc(
@@ -879,8 +984,8 @@ async fn wake_budget_is_per_caller_did() {
             "controllerVtaDid": did_key_for(&vta),
         }),
     );
-    let handle = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await["payload"]
-        ["wakeHandle"]["handle"]
+    let handle = body_json(app.clone().oneshot(post(&reg, None).await).await.unwrap()).await
+        ["payload"]["wakeHandle"]["handle"]
         .as_str()
         .unwrap()
         .to_string();
@@ -890,7 +995,13 @@ async fn wake_budget_is_per_caller_did() {
                 [did_key_for(&noisy), did_key_for(&quiet)] } }),
     );
     assert!(is_success(
-        &body_json(app.clone().oneshot(post(&prov, Some(&vta))).await.unwrap()).await
+        &body_json(
+            app.clone()
+                .oneshot(post(&prov, Some(&vta)).await)
+                .await
+                .unwrap()
+        )
+        .await
     ));
 
     // The noisy trigger burns its own bucket (provision above already spent one
@@ -900,7 +1011,7 @@ async fn wake_budget_is_per_caller_did() {
     for _ in 0..10 {
         let out = body_json(
             app.clone()
-                .oneshot(post(&wake, Some(&noisy)))
+                .oneshot(post(&wake, Some(&noisy)).await)
                 .await
                 .unwrap(),
         )
@@ -914,7 +1025,7 @@ async fn wake_budget_is_per_caller_did() {
     // The quiet trigger is unaffected.
     let out = body_json(
         app.clone()
-            .oneshot(post(&wake, Some(&quiet)))
+            .oneshot(post(&wake, Some(&quiet)).await)
             .await
             .unwrap(),
     )
@@ -935,7 +1046,8 @@ async fn eleventh_registration_is_refused_at_capacity() {
             ..StoreLimits::default()
         }),
         Limits::permissive(),
-    );
+    )
+    .await;
     let app = router(st.clone());
     let metrics_app = metrics_router(st, None);
 
@@ -947,7 +1059,7 @@ async fn eleventh_registration_is_refused_at_capacity() {
                 "controllerVtaDid": did_key_for(&signing_key()),
             }),
         );
-        let out = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await;
+        let out = body_json(app.clone().oneshot(post(&reg, None).await).await.unwrap()).await;
         assert!(
             is_success(&out),
             "registration {i} is within the cap: {out}"
@@ -961,7 +1073,7 @@ async fn eleventh_registration_is_refused_at_capacity() {
             "controllerVtaDid": did_key_for(&signing_key()),
         }),
     );
-    let out = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await;
+    let out = body_json(app.clone().oneshot(post(&reg, None).await).await.unwrap()).await;
     assert!(!is_success(&out), "the 11th must be refused: {out}");
     assert!(
         out.to_string().contains("gateway at capacity"),
@@ -978,13 +1090,16 @@ async fn eleventh_registration_is_refused_at_capacity() {
 /// though each request is otherwise valid.
 #[tokio::test]
 async fn repeated_registration_of_one_token_is_capped() {
-    let app = router(state_with(
-        Store::with_limits(StoreLimits {
-            max_per_token: 2,
-            ..StoreLimits::default()
-        }),
-        Limits::permissive(),
-    ));
+    let app = router(
+        state_with(
+            Store::with_limits(StoreLimits {
+                max_per_token: 2,
+                ..StoreLimits::default()
+            }),
+            Limits::permissive(),
+        )
+        .await,
+    );
 
     let mut accepted = 0;
     for _ in 0..6 {
@@ -996,7 +1111,7 @@ async fn repeated_registration_of_one_token_is_capped() {
                 "controllerVtaDid": did_key_for(&signing_key()),
             }),
         );
-        let out = body_json(app.clone().oneshot(post(&reg, None)).await.unwrap()).await;
+        let out = body_json(app.clone().oneshot(post(&reg, None).await).await.unwrap()).await;
         if is_success(&out) {
             accepted += 1;
         } else {
@@ -1103,7 +1218,7 @@ async fn wake_to_a_stored_internal_endpoint_never_dials() {
     );
 
     let egress = Arc::new(EgressPolicy::default());
-    let mut st = state_with(store, Limits::permissive());
+    let mut st = state_with(store, Limits::permissive()).await;
     st.egress = egress.clone();
     st.senders = Arc::new(vec![real_webpush_sender(egress)]);
     let app = router(st.clone());
@@ -1112,7 +1227,7 @@ async fn wake_to_a_stored_internal_endpoint_never_dials() {
     let wake = tt_doc(PUSH_WAKE, json!({ "handle": "legacy-handle", "v": 1 }));
     let out = body_json(
         app.clone()
-            .oneshot(post(&wake, Some(&trigger)))
+            .oneshot(post(&wake, Some(&trigger)).await)
             .await
             .unwrap(),
     )
@@ -1163,7 +1278,7 @@ async fn register_refusals_reveal_nothing_about_the_target() {
     ];
     let mut reasons = Vec::new();
     for endpoint in fixtures {
-        let (app, metrics_app) = routers();
+        let (app, metrics_app) = routers().await;
         let reg = tt_doc(
             PUSH_REGISTER,
             json!({
@@ -1172,7 +1287,7 @@ async fn register_refusals_reveal_nothing_about_the_target() {
                 "controllerVtaDid": did_key_for(&signing_key()),
             }),
         );
-        let out = body_json(app.oneshot(post(&reg, None)).await.unwrap()).await;
+        let out = body_json(app.oneshot(post(&reg, None).await).await.unwrap()).await;
         assert!(!is_success(&out), "{endpoint} must be refused: {out}");
 
         // Nothing that would let the caller tell one internal target from
@@ -1220,7 +1335,7 @@ async fn register_refusals_reveal_nothing_about_the_target() {
 async fn refused_registrations_are_never_counted() {
     // (1) No sender handles the platform (PG-N3): the state carries only a Web
     // Push sender, so an APNs registration has nowhere to go.
-    let mut st = state_with(Store::new(), Limits::permissive());
+    let mut st = state_with(Store::new(), Limits::permissive()).await;
     let egress = Arc::new(EgressPolicy::default());
     st.egress = egress.clone();
     st.senders = Arc::new(vec![real_webpush_sender(egress)]);
@@ -1234,7 +1349,7 @@ async fn refused_registrations_are_never_counted() {
             "controllerVtaDid": did_key_for(&signing_key()),
         }),
     );
-    let out = body_json(app.oneshot(post(&reg, None)).await.unwrap()).await;
+    let out = body_json(app.oneshot(post(&reg, None).await).await.unwrap()).await;
     assert!(!is_success(&out), "apns has no sender here: {out}");
     assert!(
         out.to_string()
@@ -1256,7 +1371,8 @@ async fn refused_registrations_are_never_counted() {
             ..StoreLimits::default()
         }),
         Limits::permissive(),
-    );
+    )
+    .await;
     let app = router(st.clone());
     let metrics_app = metrics_router(st, None);
     for _ in 0..6 {
@@ -1267,7 +1383,7 @@ async fn refused_registrations_are_never_counted() {
                 "controllerVtaDid": did_key_for(&signing_key()),
             }),
         );
-        app.clone().oneshot(post(&reg, None)).await.unwrap();
+        app.clone().oneshot(post(&reg, None).await).await.unwrap();
     }
     assert!(
         metrics_text(&metrics_app)

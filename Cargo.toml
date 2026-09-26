@@ -18,26 +18,38 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
-# Trigger / provision authentication: callers sign the request body with their
-# did:key Ed25519 key; the gateway resolves the did:key offline and verifies.
-ed25519-dalek = "2"
+# did:key / Multikey decoding for issuer keys (src/proof.rs) and the opaque
+# handle encoding.
 bs58 = "0.5"
 base64 = "0.22"
 # Opaque handle generation (CSPRNG).
 rand = "0.10"
 # Canonical Trust Task envelope + the push/* payload types (the gateway's
-# control plane is the push/* Trust Task family). The gateway dispatches
-# push/register|provision|wake documents over HTTPS (and, next, DIDComm).
-trust-tasks-rs = { version = "0.22.7", default-features = false }
+# control plane is the push/* Trust Task family). The gateway accepts
+# push/register|provision|wake documents over every transport it serves
+# (DIDComm, HTTPS), all through one intake (src/intake.rs).
+trust-tasks-rs = { version = "0.23.2", default-features = false }
+# The proof-purpose contract for a document's Data Integrity proof:
+# `ProofPurposeResolver` releases a key only for the relationship the proof
+# declares, and `PurposeBound` applies it when verifying (src/proof.rs).
+trust-tasks-proof = "0.23.2"
 # Response document ids (urn:uuid).
 uuid = { version = "1", features = ["v4"] }
 # DIDComm server transport (the preferred transport). Mirrors vta-service:
 # DIDCommService + Router host that does server-side unpack + sender-auth; the
 # gateway provides its provisioned did:webvh identity secrets + a Router of
 # push/* handlers that call the shared dispatch_push core.
-affinidi-messaging-didcomm-service = "0.12.1"
-affinidi-tdk = "0.17"
-affinidi-secrets-resolver = "0.5"
+affinidi-messaging-didcomm-service = "0.13"
+affinidi-tdk = "0.18"
+affinidi-secrets-resolver = "0.5.12"
+# Data Integrity (`eddsa-jcs-2022`) verification of the proof a `push/provision`
+# or `push/wake` document carries, on every transport — the caller is the
+# document issuer that proof establishes, not the transport's sender
+# (src/proof.rs). Also signs the `test-wake*` helpers' documents.
+affinidi-data-integrity = "0.7.13"
+# The acceptance window for a document's `issuedAt` and the retention of the
+# replay record (src/intake.rs). Already in the tree via trust-tasks-rs.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # 0.8.37 is a floor, not cosmetic: it is the first release whose did:web **and**
 # did:webvh resolvers refuse non-public hosts by default (didwebvh-rs 0.7's
 # `HostPolicy`). A DID names the host its document is fetched from, and the
@@ -87,6 +99,8 @@ tower_governor = { version = "0.8", default-features = false, features = ["axum"
 tempfile = "3"
 
 [dev-dependencies]
+# Test parties' Ed25519 keys.
+ed25519-dalek = "2"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # Paused-clock tests for the wake send timeout.

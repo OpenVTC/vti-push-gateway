@@ -5,9 +5,9 @@
 //! Most tests drive [`intake::receive`] directly: it is everything a transport
 //! adapter does after unpacking (the DIDComm handler passes the envelope's
 //! `from` as the transport sender). The `every_transport` tests run the same
-//! documents through both adapters — DIDComm's handoff and `POST /trust-tasks`
-//! — and expect the same answers. Parties are `did:key`s, which resolve
-//! offline.
+//! documents through every adapter — TSP's handoff (the binding envelope, with
+//! the authenticated sender VID), DIDComm's handoff and `POST /trust-tasks` —
+//! and expect the same answers. Parties are `did:key`s, which resolve offline.
 
 use std::sync::Arc;
 
@@ -31,6 +31,7 @@ use vti_push_gateway::limits::Limits;
 use vti_push_gateway::proof::ProofVerifier;
 use vti_push_gateway::sender::{EchoSender, PushSender};
 use vti_push_gateway::store::Store;
+use vti_push_gateway::tsp;
 
 const PUSH_REGISTER: &str = "https://trusttasks.org/spec/push/register/0.2";
 const PUSH_PROVISION: &str = "https://trusttasks.org/spec/push/provision/0.2";
@@ -134,6 +135,9 @@ async fn send(st: &AppState, from: Option<&str>, body: &Value) -> Value {
 /// The transports the gateway serves.
 #[derive(Debug, Clone, Copy)]
 enum Transport {
+    /// The TSP adapter's handoff: the unpacked payload — the document in the
+    /// TSP binding envelope — with the authenticated sender VID.
+    Tsp,
     /// The DIDComm adapter's handoff: the unpacked body, with the envelope's
     /// `from` as the transport sender.
     Didcomm,
@@ -141,10 +145,25 @@ enum Transport {
     Https,
 }
 
-const TRANSPORTS: [Transport; 2] = [Transport::Didcomm, Transport::Https];
+const TRANSPORTS: [Transport; 3] = [Transport::Tsp, Transport::Didcomm, Transport::Https];
+
+/// The transports that make a claim about their sender.
+const SENDER_CLAIMING: [Transport; 2] = [Transport::Tsp, Transport::Didcomm];
 
 async fn send_via(st: &AppState, t: Transport, from: &str, body: &Value) -> Value {
     match t {
+        Transport::Tsp => {
+            let reply = tsp::receive(st, from, &tsp::wrap_envelope(body))
+                .await
+                .expect("a TSP reply");
+            let envelope: Value = serde_json::from_slice(&reply).unwrap();
+            assert_eq!(
+                envelope["type"],
+                tsp::ENVELOPE_TYPE,
+                "{t:?}: reply envelope"
+            );
+            envelope["document"].clone()
+        }
         Transport::Didcomm => send(st, Some(from), body).await,
         Transport::Https => {
             let req = Request::builder()
@@ -297,18 +316,26 @@ async fn non_controller_with_a_valid_proof_is_refused() {
     assert_eq!(error_code(&resp), "permissionDenied", "{resp}");
 }
 
-/// When the envelope names a sender, it must be the proven issuer.
+/// When the transport names a sender — a DIDComm envelope's `from`, a TSP
+/// sender VID — it must be the proven issuer. Either way it is a claim, even
+/// when the transport authenticated it.
 #[tokio::test]
-async fn envelope_sender_contradicting_the_proof_is_refused() {
-    let st = test_state().await;
-    let vta = Party::new();
-    let other = Party::new();
-    let handle = register(&st, &vta.did).await;
+async fn a_transport_sender_contradicting_the_proof_is_refused() {
+    for t in SENDER_CLAIMING {
+        let st = test_state().await;
+        let vta = Party::new();
+        let other = Party::new();
+        let handle = register(&st, &vta.did).await;
 
-    let prov = vta.sign(provision_doc(&vta.did, &handle, &vta.did)).await;
-    let resp = send(&st, Some(&other.did), &prov).await;
-    assert!(!is_success(&resp), "{resp}");
-    assert_eq!(error_code(&resp), "identityMismatch", "{resp}");
+        let prov = vta.sign(provision_doc(&vta.did, &handle, &vta.did)).await;
+        let resp = send_via(&st, t, &other.did, &prov).await;
+        assert!(!is_success(&resp), "{t:?}: {resp}");
+        assert_eq!(error_code(&resp), "identityMismatch", "{t:?}: {resp}");
+        // And the refusal changed nothing: the proven issuer's own delivery
+        // of the same document still goes through.
+        let resp = send_via(&st, t, &vta.did, &prov).await;
+        assert!(is_success(&resp), "{t:?}: {resp}");
+    }
 }
 
 /// A signed document addressed to another gateway is refused.
@@ -960,19 +987,59 @@ async fn every_transport_refuses_what_the_proof_does_not_authorise() {
 }
 
 /// The record is shared by the transports: a document accepted on one is a
-/// replay on the other.
+/// replay on every other.
 #[tokio::test]
 async fn a_replay_on_another_transport_is_still_a_replay() {
+    for first_on in TRANSPORTS {
+        let st = test_state().await;
+        let vta = Party::new();
+        let handle = provisioned(&st, &vta, &[&vta.did]).await;
+        let wake = vta.sign(wake_doc(&vta.did, &handle)).await;
+        let first = send_via(&st, first_on, &vta.did, &wake).await;
+        assert!(is_success(&first), "{first_on:?}: {first}");
+        let sent = delivered(&st);
+        for again_on in TRANSPORTS {
+            let again = send_via(&st, again_on, &vta.did, &wake).await;
+            assert_eq!(
+                again, first,
+                "accepted on {first_on:?}, replayed on {again_on:?}"
+            );
+        }
+        assert_eq!(delivered(&st), sent, "{first_on:?}: not sent again");
+    }
+}
+
+/// A Trust Task over TSP travels in the binding envelope. A bare document is
+/// answered with `malformedRequest` (in the envelope) and not executed; a
+/// payload that is no Trust Task at all is not answered.
+#[tokio::test]
+async fn a_tsp_payload_outside_the_binding_envelope_is_refused() {
     let st = test_state().await;
     let vta = Party::new();
-    let handle = provisioned(&st, &vta, &[&vta.did]).await;
-    let wake = vta.sign(wake_doc(&vta.did, &handle)).await;
-    let first = send_via(&st, Transport::Didcomm, &vta.did, &wake).await;
-    assert!(is_success(&first), "{first}");
-    let sent = delivered(&st);
-    let again = send_via(&st, Transport::Https, &vta.did, &wake).await;
-    assert_eq!(again, first);
-    assert_eq!(delivered(&st), sent, "not sent again");
+    let handle = register(&st, &vta.did).await;
+    let prov = vta.sign(provision_doc(&vta.did, &handle, &vta.did)).await;
+
+    let reply = tsp::receive(&st, &vta.did, &serde_json::to_vec(&prov).unwrap())
+        .await
+        .expect("a bare document is answered");
+    let envelope: Value = serde_json::from_slice(&reply).unwrap();
+    assert_eq!(envelope["type"], tsp::ENVELOPE_TYPE);
+    assert_eq!(
+        error_code(&envelope["document"]),
+        "malformedRequest",
+        "{envelope}"
+    );
+
+    // Not executed: the same document in the envelope is accepted, not a replay.
+    let resp = send_via(&st, Transport::Tsp, &vta.did, &prov).await;
+    assert!(is_success(&resp), "{resp}");
+
+    assert!(tsp::receive(&st, &vta.did, b"not json").await.is_none());
+    assert!(tsp::receive(&st, &vta.did, br#"{"hello":"world"}"#)
+        .await
+        .is_none());
+    let empty = serde_json::to_vec(&json!({ "type": tsp::ENVELOPE_TYPE })).unwrap();
+    assert!(tsp::receive(&st, &vta.did, &empty).await.is_none());
 }
 
 /// A gateway with no DID can be no document's recipient, so it accepts no

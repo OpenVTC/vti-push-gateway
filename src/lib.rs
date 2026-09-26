@@ -16,4 +16,5 @@ pub mod resolver;
 pub mod secretfile;
 pub mod sender;
 pub mod store;
+pub mod tsp;
 pub mod types;

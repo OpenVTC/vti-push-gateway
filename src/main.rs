@@ -3,14 +3,14 @@
 //! the app's platform push credentials, issues opaque wake handles, enforces a
 //! VTA-provisioned trigger allowlist, and relays **contentless** wakes.
 //!
-//! The control plane is the `push/*` Trust Task family, accepted over two
+//! The control plane is the `push/*` Trust Task family, accepted over three
 //! transports that share one intake (`intake::receive`), so `push/provision`
-//! and `push/wake` are authorised identically on both — by the Data Integrity
-//! proof on the document, bound to its issuer, fresh, addressed to this
-//! gateway's DID, and once only:
-//! - **DIDComm** — when `GATEWAY_IDENTITY_FILE` provides the gateway's
-//!   provisioned `did:webvh` identity, a `DIDCommService` connects to the
-//!   mediator.
+//! and `push/wake` are authorised identically on all of them — by the Data
+//! Integrity proof on the document, bound to its issuer, fresh, addressed to
+//! this gateway's DID, and once only:
+//! - **TSP** and **DIDComm** — when `GATEWAY_IDENTITY_FILE` provides the
+//!   gateway's provisioned `did:webvh` identity, one messaging service connects
+//!   to the mediator and carries both on the same socket.
 //! - **HTTPS** — `POST /trust-tasks`.
 //!
 //! Without an identity the gateway has no DID to be addressed to, so it serves
@@ -294,11 +294,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // transport. Under the tuned resolver's host policy: the DIDs it resolves
     // are named by inbound documents.
     let tuning = vti_push_gateway::resolver::ResolverTuning::from_env();
-    let proofs = vti_push_gateway::proof::ProofVerifier::new(Arc::new(
+    let resolver = Arc::new(
         affinidi_did_resolver_cache_sdk::DIDCacheClient::new(tuning.did_cache_config())
             .await
             .map_err(|e| format!("build proof DID resolver: {e}"))?,
-    ));
+    );
+    let proofs = vti_push_gateway::proof::ProofVerifier::new(resolver.clone());
     if identity.is_none() {
         tracing::warn!(
             "no GATEWAY_IDENTITY_FILE — the gateway has no DID for a document to be \
@@ -318,22 +319,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gateway_did: identity.as_ref().map(|id| id.did.clone()),
     };
 
-    // Start the DIDComm listener (preferred transport) if provisioned.
+    // Start the mediator listener if provisioned: DIDComm and TSP on the one
+    // socket the mediator allows per DID.
     let didcomm_shutdown = CancellationToken::new();
     let _didcomm_service = match &identity {
         Some(id) => match didcomm::start(id, state.clone(), didcomm_shutdown.clone()).await {
             Ok(svc) => {
                 tracing::warn!(did = %id.did, mediator = %id.mediator,
-                    "DIDComm listener started (preferred transport)");
+                    "mediator listener started (TSP and DIDComm)");
+                // Peers find the TSP endpoint in the DID document; say so if
+                // it is not there. Off the startup path: resolution can wait
+                // on the network.
+                let (resolver, did, mediator) =
+                    (resolver.clone(), id.did.clone(), id.mediator.clone());
+                tokio::spawn(async move {
+                    vti_push_gateway::tsp::check_advertised(&resolver, &did, &mediator).await;
+                });
                 Some(svc)
             }
             Err(e) => {
-                tracing::error!(error = %e, "DIDComm listener failed to start; HTTPS-only");
+                tracing::error!(error = %e, "mediator listener failed to start; HTTPS-only");
                 None
             }
         },
         None => {
-            tracing::warn!("no GATEWAY_IDENTITY_FILE — DIDComm disabled, HTTPS-only");
+            tracing::warn!("no GATEWAY_IDENTITY_FILE — TSP and DIDComm disabled, HTTPS-only");
             None
         }
     };

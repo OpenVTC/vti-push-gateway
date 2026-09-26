@@ -27,11 +27,11 @@ The gateway's control plane is the **`push/*` Trust Task family**
 [`push/provision`](https://trusttasks.org/spec/push/provision/0.2),
 [`push/wake`](https://trusttasks.org/spec/push/wake/0.2)). It dispatches
 `TrustTask` documents (canonical `trust-tasks-rs` envelope), so the same
-documents ride **DIDComm or HTTPS**, and every transport hands them to one
+documents ride **TSP, DIDComm or HTTPS**, and every transport hands them to one
 intake (`src/intake.rs`) that authorises them identically — by the document's
 own proof, never by the transport (see "Authentication" below).
 
-Implemented: both transports (HTTPS + DIDComm) + in-memory stores + four
+Implemented: all three transports (TSP + DIDComm + HTTPS) + in-memory stores + four
 senders — a real **Web Push (VAPID)** sender (`GATEWAY_VAPID_KEY_FILE`,
 self-hostable, no Apple/Google account), a real **APNs** sender
 (`GATEWAY_APNS_KEY_FILE` + key id + team id; provider-token JWT API, contentless
@@ -46,17 +46,36 @@ refused outright. The handle registry is in-memory by default, or **durable**
 via a JSON snapshot when `GATEWAY_STORE_FILE` is set (handles/tokens survive a
 restart).
 
-**DIDComm transport (preferred)** is wired: when `GATEWAY_IDENTITY_FILE`
-provides the gateway's provisioned `did:webvh` identity, a `DIDCommService`
-(`affinidi-messaging-didcomm-service`) connects to the mediator and hands
-inbound `push/*` to the shared intake — the crate does the unpack, and the
-intake authenticates `push/provision` / `push/wake` by the Data Integrity proof
-on the Trust Task document, exactly as for `POST /trust-tasks`. The identity is
-also what makes the gateway addressable: without it the gateway has no DID for
-a document to name as its `recipient`, so it serves `push/register` only.
-TSP is not served yet; adding it is one more adapter calling the same intake
-(a TSP listener under the gateway's identity, advertised as `TSPTransport` in
-its DID document), with no change to authorisation.
+**TSP and DIDComm transports** are wired: when `GATEWAY_IDENTITY_FILE`
+provides the gateway's provisioned `did:webvh` identity, one messaging service
+(`affinidi-messaging-didcomm-service`, `tsp` feature) connects to the mediator
+under that identity and carries both protocols on the same websocket — the
+mediator allows one per DID. The service does the unpack; DIDComm messages go
+to `src/didcomm.rs` and TSP messages to `src/tsp.rs`, and both hand the Trust
+Task document to the shared intake, which authenticates `push/provision` /
+`push/wake` by the Data Integrity proof on the document, exactly as for
+`POST /trust-tasks`. The identity is also what makes the gateway addressable:
+without it the gateway has no DID for a document to name as its `recipient`, so
+it serves `push/register` only.
+
+Over TSP a document travels in the [TSP binding](https://trusttasks.org/binding/tsp/0.1)
+envelope, `{"type": "https://trusttasks.org/binding/tsp/0.1/envelope",
+"document": …}`, and the reply comes back in one; a bare document is answered
+with `malformedRequest` and not executed. The gateway accepts a peer's TSP
+relationship invite (which grants nothing — every document still needs its
+proof). Relationships are held in memory, so after a restart a peer re-invites.
+
+Peers find the TSP endpoint in the gateway's DID document, as a `TSPTransport`
+service naming the mediator's DID:
+
+```json
+{ "id": "{DID}#tsp", "type": "TSPTransport", "serviceEndpoint": "<mediator DID>" }
+```
+
+At startup the gateway resolves its own DID and warns if that entry is missing
+or names another mediator than the one in its identity file. Add it when the
+DID is minted, or afterwards with the VTA's `dids edit`.
+
 Identity is provisioned like any integration: `pnm bootstrap
 provision-integration --template push-gateway --var URL=<gateway-didcomm-url>`,
 then open the bundle into the identity file.
@@ -64,7 +83,7 @@ then open the bundle into the identity file.
 **Metrics** are exposed at `GET /metrics` in Prometheus text-exposition format
 (`gateway_register_total`, `gateway_provision_total{outcome}`,
 `gateway_wake_total{outcome}`) — counted in the transport-agnostic dispatch core,
-so both HTTPS and DIDComm wakes are covered. They are served on a **separate
+so wakes over every transport are covered. They are served on a **separate
 management listener**, `GATEWAY_METRICS_BIND` (default `127.0.0.1:9300`), and not
 on the public router: the counters describe a push fleet's volumes and failure
 modes, and a reverse proxy that forwards `location /` wholesale would otherwise
@@ -121,7 +140,9 @@ how the VTA sends them. The caller is the document's `issuer`, and only when:
 
 No transport-level identity authorises anything: HTTP headers carry none (the
 old `X-TT-Did` / `X-TT-Signature` body signature is gone), and a DIDComm
-envelope's `from` must merely agree with the proven issuer.
+envelope's `from` or a TSP sender VID must merely agree with the proven issuer
+— even though TSP authenticates its sender, that is still the transport's
+claim, not the document's.
 
 An `authentication` proof carries no challenge, so the document binds it to one
 delivery (VTI-KEY-107): it must name this gateway as `recipient`, carry an
@@ -129,8 +150,8 @@ delivery (VTI-KEY-107): it must name this gateway as `recipient`, carry an
 (VTI-OPS-024; `expired` / `malformedRequest` otherwise) and not be past its
 `expiresAt`, and carry an `id` the same issuer has not already had accepted
 within that window (VTI-OPS-026). The record is keyed by (proven issuer, id),
-shared by every transport (a document accepted over DIDComm is a replay over
-HTTPS), bounded, fail-closed (full means refused, never evicted), and claimed
+shared by every transport (a document accepted over TSP is a replay over
+DIDComm and over HTTPS, and so on), bounded, fail-closed (full means refused, never evicted), and claimed
 only after the caller has been rate-limited and
 authorised for the handle, so a refused caller leaves nothing in it. A second
 delivery of an accepted document is answered with the first response and not
@@ -164,15 +185,15 @@ deliberate use; it logs a startup warning and keeps every bound below.
   twice the soft bound caps memory. A refusal is `taskFailed`, retryable later.
 
 Registration itself stays anonymous and is rate-limited globally (and per peer
-IP over HTTPS); the DIDComm path has no trustworthy anonymous source to key a
+IP over HTTPS); the TSP and DIDComm paths have no trustworthy anonymous source to key a
 per-source budget on.
 
 `push/provision` then requires that issuer to be the handle's
 `controllerVtaDid`; `push/wake` requires it to be on the allowlist. A
 transport's sender is never an authorising identity on its own: a document
 without a proof is anonymous (`push/register` only; provision/wake get
-`proofRequired`), a DIDComm envelope sender that differs from the proven issuer
-gets `identityMismatch`, and a document whose `recipient` is not this gateway's
+`proofRequired`), a DIDComm envelope sender or TSP sender VID that differs
+from the proven issuer gets `identityMismatch`, and a document whose `recipient` is not this gateway's
 DID gets `wrongRecipient`.
 
 ### Example (HTTPS)
@@ -207,7 +228,7 @@ cargo run
 # GATEWAY_BIND=127.0.0.1:8300   bind address (HTTPS transport)
 # GATEWAY_ADDR=https://gw.example   handle gateway field when HTTPS-only (no identity)
 # GATEWAY_IDENTITY_FILE=./gateway-identity.json   provisioned did:webvh identity →
-#                       enables the DIDComm transport; handles advertise the DID
+#                       enables the TSP and DIDComm transports; handles advertise the DID
 # GATEWAY_VAPID_KEY_FILE=./vapid.pem   VAPID private key (PEM) → enables the
 #                       Web Push sender. Generate with: cargo run -- vapid-keygen
 # GATEWAY_VAPID_SUBJECT=mailto:ops@example.com   VAPID contact (sub claim)
@@ -299,8 +320,8 @@ cargo run
 ```
 
 With `GATEWAY_IDENTITY_FILE` set the gateway connects to the mediator named in
-the identity and serves `push/*` over DIDComm as well as HTTPS, with the same
-authorisation on both; without it there is no gateway DID to address documents
+the identity and serves `push/*` over TSP and DIDComm as well as HTTPS, with
+the same authorisation on all three; without it there is no gateway DID to address documents
 to, so only `push/register` (over HTTPS) is served. See `src/identity.rs` for the identity file shape.
 
 ## Testing Web Push end-to-end
@@ -328,8 +349,8 @@ The wake loop spans the gateway, a VTA + mediator, and the browser plugin. A
    ```
 
    Provision a gateway identity and set `GATEWAY_IDENTITY_FILE` (see above):
-   signed provisions and wakes are addressed to the gateway's DID, on DIDComm
-   and HTTPS alike, so a gateway without one accepts none.
+   signed provisions and wakes are addressed to the gateway's DID, on TSP,
+   DIDComm and HTTPS alike, so a gateway without one accepts none.
 
 3. **Configure the plugin** (extension → Settings):
    - *Push gateway VAPID public key* → the value from step 1/2. (This alone makes
@@ -470,8 +491,8 @@ Trust Task is pulled from the mediator.
     `GATEWAY_MAX_HANDLES_PER_TOKEN` live handles per device token / Web Push
     endpoint, so one token cannot occupy the registry, and
     `GATEWAY_MAX_HANDLES_PER_CONTROLLER` per named controller DID.
-  - **Rate limits in two layers**, because the DIDComm transport — the preferred
-    one — never passes through HTTP middleware. A `tower_governor` layer limits
+  - **Rate limits in two layers**, because the TSP and DIDComm transports never
+    pass through HTTP middleware. A `tower_governor` layer limits
     `POST /trust-tasks` per peer IP (429), and the transport-agnostic dispatch
     core limits `register` against a global budget and `provision`/`wake` against
     a budget keyed by the authenticated caller DID. The keyed buckets are

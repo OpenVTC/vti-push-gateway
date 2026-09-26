@@ -1,4 +1,5 @@
-//! The gateway's DIDComm transport adapter.
+//! The gateway's DIDComm transport adapter, and the mediator listener it shares
+//! with TSP.
 //!
 //! Built on `affinidi-messaging-didcomm-service` (the same crate `vta-service`
 //! uses), which does the server-side work — connect to the mediator, receive,
@@ -14,11 +15,15 @@
 //! agree with the proven issuer and never stands in for it (see
 //! [`crate::intake`]). The reply is packed back to the envelope sender by the
 //! service.
+//!
+//! The same listener carries TSP: the mediator allows one websocket per DID, so
+//! the service multiplexes both protocols off it ([`Protocols::BOTH`]) and hands
+//! TSP messages to [`crate::tsp::TspIntake`], which feeds the same intake.
 
 use affinidi_messaging_didcomm_service::{
     handler_fn, ignore_handler, trust_ping_handler, DIDCommResponse, DIDCommService,
     DIDCommServiceConfig, DIDCommServiceError, Extension, HandlerContext, ListenerConfig,
-    RestartPolicy, RetryConfig, Router, MESSAGE_PICKUP_STATUS_TYPE, TRUST_PING_TYPE,
+    Protocols, RestartPolicy, RetryConfig, Router, MESSAGE_PICKUP_STATUS_TYPE, TRUST_PING_TYPE,
 };
 
 use affinidi_tdk::common::profiles::TDKProfile;
@@ -29,6 +34,7 @@ use crate::api::AppState;
 use crate::identity::GatewayIdentity;
 use crate::intake;
 use crate::resolver::ResolverTuning;
+use crate::tsp::TspIntake;
 
 /// DIDComm message type wrapping a Trust Task document (the DIDComm binding's
 /// envelope). The request body and the reply both carry a Trust Task doc here.
@@ -62,9 +68,10 @@ fn build_router(state: AppState) -> Result<Router, DIDCommServiceError> {
         .route(TRUST_TASK_ENVELOPE_TYPE, handler_fn(handle_push))
 }
 
-/// Start the gateway's DIDComm listener: connect to the mediator as the
-/// provisioned `did:webvh` identity and hand inbound `push/*` to the shared
-/// intake. Returns the running service (cancel `shutdown` to stop it).
+/// Start the gateway's mediator listener: connect to the mediator as the
+/// provisioned `did:webvh` identity and hand inbound `push/*` — over DIDComm
+/// and over TSP, on the one socket — to the shared intake. Returns the running
+/// service (cancel `shutdown` to stop it).
 pub async fn start(
     identity: &GatewayIdentity,
     state: AppState,
@@ -93,11 +100,12 @@ pub async fn start(
                 },
             },
             tdk_config: Some(tdk_config),
+            protocols: Protocols::BOTH,
             ..Default::default()
         }],
     };
-    let router = build_router(state).map_err(|e| format!("build router: {e}"))?;
-    DIDCommService::start(config, router, shutdown)
+    let router = build_router(state.clone()).map_err(|e| format!("build router: {e}"))?;
+    DIDCommService::start_with_tsp(config, router, TspIntake::new(state), shutdown)
         .await
-        .map_err(|e| format!("DIDComm service start: {e}"))
+        .map_err(|e| format!("messaging service start: {e}"))
 }

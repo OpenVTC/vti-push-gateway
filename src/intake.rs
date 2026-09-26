@@ -2,11 +2,10 @@
 //!
 //! Every remote operation here is a Trust Task, and a Trust Task is
 //! authorised by what the document proves, not by the transport that carried
-//! it. So each transport adapter — HTTPS (`POST /trust-tasks`, [`crate::api`])
-//! and DIDComm ([`crate::didcomm`]) — does only its own unpacking and then
-//! calls [`receive`]; the authentication, freshness and replay rules below are
-//! the same whichever transport a document arrived on. A new transport (TSP)
-//! is another caller of [`receive`], nothing more.
+//! it. So each transport adapter — HTTPS (`POST /trust-tasks`, [`crate::api`]),
+//! DIDComm ([`crate::didcomm`]) and TSP ([`crate::tsp`]) — does only its own
+//! unpacking and then calls [`receive`]; the authentication, freshness and
+//! replay rules below are the same whichever transport a document arrived on.
 //!
 //! ## Who the caller is
 //!
@@ -14,9 +13,10 @@
 //! proof on the document itself ([`crate::proof`]): the caller is the
 //! document's `issuer`, and only once the proof binds that issuer to one of
 //! its own `authentication` keys (VTI-KEY-106). A transport's own claim about
-//! its sender — a DIDComm envelope's `from` — authorises nothing; when there is
-//! one it must agree with the proven issuer, and a mismatch is refused as an
-//! identity mismatch rather than resolved in either party's favour. A document
+//! its sender — a DIDComm envelope's `from`, a TSP sender VID — authorises
+//! nothing, even when the transport authenticated it; when there is one it
+//! must agree with the proven issuer, and a mismatch is refused as an identity
+//! mismatch rather than resolved in either party's favour. A document
 //! without a proof is anonymous, so `push/register` (anonymous by design) still
 //! works and `push/provision` / `push/wake` are refused with `proofRequired`.
 //!
@@ -54,8 +54,9 @@ use crate::replay::{Admission, ReplayRecord};
 /// Returns the proven issuer DID, `Ok(None)` for a document with no proof (an
 /// anonymous caller — acceptable for `push/register` only, which the core
 /// enforces), or the refusal to send back. `transport_sender` is whatever the
-/// transport claims about its sender (a DIDComm envelope's `from`); it is
-/// compared against the proven issuer but never trusted in its place.
+/// transport claims about its sender (a DIDComm envelope's `from`, a TSP
+/// sender VID); it is compared against the proven issuer but never trusted in
+/// its place.
 pub async fn authenticate(
     state: &AppState,
     transport_sender: Option<&str>,
@@ -195,7 +196,7 @@ impl AdmitOnce for DocumentOnce<'_> {
 /// is not a Trust Task document at all and there is nothing to answer.
 ///
 /// `transport_sender` is the transport's own claim about its sender, if it
-/// makes one (see [`authenticate`]); HTTPS makes none.
+/// makes one (see [`authenticate`]): DIDComm and TSP do, HTTPS makes none.
 pub async fn receive(
     state: &AppState,
     transport_sender: Option<&str>,

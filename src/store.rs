@@ -38,7 +38,7 @@
 //!   most once per interval, keeping temp-file + fsync + rename.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -388,7 +388,7 @@ impl Store {
                 }
             }
         };
-        match write_snapshot(path, &json) {
+        match secretfile::write_owner_only_atomic(path, &json) {
             Ok(()) => {
                 self.writes.fetch_add(1, Ordering::Relaxed);
                 true
@@ -592,38 +592,6 @@ impl Drop for Store {
     fn drop(&mut self) {
         self.flush();
     }
-}
-
-/// Write the snapshot to `path` atomically, owner-only, and durably.
-///
-/// The temporary file comes from `tempfile::NamedTempFile::new_in`, which creates
-/// it with `O_EXCL` under an unpredictable name at mode 0600. The previous
-/// `path.with_extension("json.tmp")` + `std::fs::write` had neither property: the
-/// temp name was entirely predictable, so anything that could create a file in
-/// the store's directory could pre-plant a symlink there and have the gateway
-/// write every device token wherever it pointed; and the file landed at the
-/// umask default, typically 0644. `sync_all` before `persist` means the rename
-/// cannot publish a truncated snapshot after a crash.
-fn write_snapshot(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-
-    // `new_in` needs a directory, and a bare filename's parent is empty.
-    let dir = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)
-        .map_err(|e| format!("create temp snapshot in {}: {e}", dir.display()))?;
-    tmp.write_all(bytes)
-        .map_err(|e| format!("write temp snapshot: {e}"))?;
-    tmp.as_file()
-        .sync_all()
-        .map_err(|e| format!("sync temp snapshot: {e}"))?;
-    // `persist` renames over `path`, so the snapshot inherits the temp file's
-    // 0600 rather than whatever the old file had.
-    tmp.persist(path)
-        .map_err(|e| format!("rename temp snapshot into place: {}", e.error))?;
-    Ok(())
 }
 
 #[cfg(test)]

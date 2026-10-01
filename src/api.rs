@@ -95,6 +95,12 @@ pub struct AppState {
     /// `recipient`. `None` without a provisioned identity, in which case no
     /// authenticated document is accepted (register only).
     pub gateway_did: Option<String>,
+    /// Durable TSP relationship store ([`crate::relationships`]), `None` when
+    /// TSP/DIDComm is disabled (no identity). [`crate::tsp`] stamps activity on
+    /// it; [`crate::didcomm`] hands it to the mediator listener so relationship
+    /// state survives a restart instead of being wiped with every peer forced
+    /// to re-invite.
+    pub tsp_relationships: Option<Arc<crate::relationships::GatewayRelationshipStore>>,
 }
 
 /// The **public** router: the `push/*` Trust-Task endpoint and a liveness probe.

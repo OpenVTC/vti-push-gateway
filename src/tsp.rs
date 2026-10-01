@@ -24,8 +24,11 @@
 //! messages. The service records every control message; this adapter answers an
 //! invite with an accept, which completes the relationship. Accepting grants
 //! nothing: every document the peer then sends meets the same proof checks as
-//! any other. Relationship state is held in memory, so after a restart a peer
-//! re-invites before its next message is admitted.
+//! any other. Relationship state is durable when the gateway was built with a
+//! store ([`crate::relationships`], wired in [`crate::didcomm::start`]), so a
+//! restart does not force every peer to re-invite before its next message is
+//! admitted; [`receive`] and [`TspIntake::handle_control`] stamp activity on it
+//! so the idle-eviction sweep only ages out relationships that have gone quiet.
 //!
 //! ## Being reachable over TSP
 //!
@@ -91,9 +94,31 @@ pub async fn receive(state: &AppState, sender_vid: &str, payload: &[u8]) -> Opti
         tracing::warn!(from = %sender_vid, "TSP binding envelope carries no document");
         return None;
     };
+    // The SDK's own §7.2.2 gate already refused anything from a VID with no
+    // relationship before this adapter runs, so reaching here proves `sender_vid`
+    // currently holds one. Stamp it active so the idle-eviction sweep
+    // (`relationships::maintenance_loop`) ages out only relationships that have
+    // gone quiet, never ones still in use.
+    touch_relationship(state, sender_vid).await;
     intake::receive(state, Some(sender_vid), document)
         .await
         .map(|response| wrap_envelope(&response))
+}
+
+/// Stamp the durable relationship with `their_vid` as active now, when the
+/// gateway has both a durable store and an own DID to stamp it under. Best
+/// effort: a failed stamp costs only an extra re-invite once the relationship
+/// looks idle, so it is logged, not surfaced.
+async fn touch_relationship(state: &AppState, their_vid: &str) {
+    let (Some(store), Some(our_vid)) = (&state.tsp_relationships, &state.gateway_did) else {
+        return;
+    };
+    let Some(now_ms) = crate::relationships::unix_millis() else {
+        return;
+    };
+    if let Err(e) = store.touch(our_vid, their_vid, now_ms).await {
+        tracing::debug!(peer = %their_vid, error = %e, "could not stamp TSP relationship activity");
+    }
 }
 
 /// The [`TspHandler`] the service calls for every TSP message on the gateway's
@@ -141,7 +166,8 @@ impl TspHandler for TspIntake {
             .await
         {
             Ok(state) => {
-                tracing::info!(sender = %sender_vid, ?state, "accepted a TSP relationship invite")
+                tracing::info!(sender = %sender_vid, ?state, "accepted a TSP relationship invite");
+                touch_relationship(&self.state, &sender_vid).await;
             }
             Err(e) => tracing::warn!(
                 sender = %sender_vid, error = %e,

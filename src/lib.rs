@@ -11,6 +11,7 @@ pub mod intake;
 pub mod limits;
 pub mod metrics;
 pub mod proof;
+pub mod relationships;
 pub mod replay;
 pub mod resolver;
 pub mod secretfile;

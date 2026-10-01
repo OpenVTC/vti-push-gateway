@@ -66,7 +66,8 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # DIDComm transport resolves DIDs chosen by whoever sends the gateway a message,
 # so resolving below this floor would reintroduce a resolver-side SSRF. Pinning
 # the patch stops a fresh `cargo update` from resolving back under it.
-affinidi-did-resolver-cache-sdk = { version = "0.8.38", features = ["network"] }
+# 0.8.39 is the floor now: earlier releases resolve a deactivated did:webvh to its last document (SEC-4045 / VGI-04).
+affinidi-did-resolver-cache-sdk = { version = "0.8.39", features = ["network"] }
 tokio-util = "0.7"
 # Async push senders (real delivery — Web Push / APNs — is async HTTP).
 async-trait = "0.1"

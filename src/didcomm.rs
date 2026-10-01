@@ -19,6 +19,10 @@
 //! The same listener carries TSP: the mediator allows one websocket per DID, so
 //! the service multiplexes both protocols off it ([`Protocols::BOTH`]) and hands
 //! TSP messages to [`crate::tsp::TspIntake`], which feeds the same intake.
+//!
+//! [`start`] hands the listener `state`'s durable TSP relationship store
+//! ([`crate::relationships`]), when one was built, so a peer's relationship
+//! survives a gateway restart instead of being wiped and forcing a re-invite.
 
 use affinidi_messaging_didcomm_service::{
     handler_fn, ignore_handler, trust_ping_handler, DIDCommResponse, DIDCommService,
@@ -89,6 +93,15 @@ pub async fn start(
     let tuning = ResolverTuning::from_env();
     tracing::info!(resolver = %tuning.summary(), "DIDComm DID-resolver tuning");
     let tdk_config = tuning.tdk_config()?;
+    // Durable across a restart when the gateway was built with one
+    // (`GATEWAY_RELATIONSHIPS_FILE`); otherwise the listener falls back to the
+    // SDK's ephemeral in-memory default, which forgets every relationship on
+    // restart and forces each peer to re-invite before its next message is
+    // admitted (the §7.2.2 gate drops it otherwise).
+    let relationship_store = state
+        .tsp_relationships
+        .clone()
+        .map(|store| store as std::sync::Arc<dyn affinidi_tdk::messaging::RelationshipStore>);
     let config = DIDCommServiceConfig {
         listeners: vec![ListenerConfig {
             id: "push-gateway".into(),
@@ -101,6 +114,7 @@ pub async fn start(
             },
             tdk_config: Some(tdk_config),
             protocols: Protocols::BOTH,
+            relationship_store,
             ..Default::default()
         }],
     };

@@ -135,6 +135,40 @@ fn check_permissions(_path: &Path, _what: &str, _strict: bool) -> Result<(), Str
     Ok(())
 }
 
+/// Write `bytes` to `path` atomically, owner-only, and durably.
+///
+/// Shared by every on-disk snapshot the gateway keeps (the push-handle
+/// registry, the durable TSP relationship store): the temp file comes from
+/// `tempfile::NamedTempFile::new_in`, which creates it with `O_EXCL` under an
+/// unpredictable name at mode 0600. A predictable `path.with_extension("tmp")`
+/// written with plain `std::fs::write` would have neither property — anything
+/// able to create a file in the snapshot's directory could pre-plant a symlink
+/// there and have the gateway write the snapshot wherever it pointed, and the
+/// file would land at the umask default, typically 0644. `sync_all` before
+/// `persist` means the rename cannot publish a truncated snapshot after a
+/// crash.
+pub fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    // `new_in` needs a directory, and a bare filename's parent is empty.
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| format!("create temp snapshot in {}: {e}", dir.display()))?;
+    tmp.write_all(bytes)
+        .map_err(|e| format!("write temp snapshot: {e}"))?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| format!("sync temp snapshot: {e}"))?;
+    // `persist` renames over `path`, so the snapshot inherits the temp file's
+    // 0600 rather than whatever the old file had.
+    tmp.persist(path)
+        .map_err(|e| format!("rename temp snapshot into place: {}", e.error))?;
+    Ok(())
+}
+
 /// Tighten `path` to owner-only if it is group- or world-accessible, warning
 /// about what was found.
 ///

@@ -283,6 +283,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Store::with_limits(store_limits)
         }
     });
+    // Durable TSP relationship store when GATEWAY_RELATIONSHIPS_FILE is set
+    // (relationships survive a restart); in-memory otherwise, in which case
+    // every peer's gate-admitted relationship is wiped on restart and each
+    // re-invites before its next message is admitted.
+    let tsp_relationships = match std::env::var("GATEWAY_RELATIONSHIPS_FILE") {
+        Ok(path) => Some(vti_push_gateway::relationships::build_relationship_store(
+            Some(path.into()),
+        )),
+        Err(_) => {
+            tracing::warn!(
+                "GATEWAY_RELATIONSHIPS_FILE not set — TSP relationships are in-memory and lost \
+                 on restart; every peer re-invites before its next message is admitted"
+            );
+            Some(vti_push_gateway::relationships::build_relationship_store(
+                None,
+            ))
+        }
+    };
+
     let limits = Arc::new(Limits::from_env());
     tracing::info!(
         register = ?limits.register_config(),
@@ -317,6 +336,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         controllers: Arc::new(controllers),
         proofs,
         gateway_did: identity.as_ref().map(|id| id.did.clone()),
+        tsp_relationships: tsp_relationships.clone(),
     };
 
     // Start the mediator listener if provisioned: DIDComm and TSP on the one
@@ -397,6 +417,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .sweep_loop(MAINTENANCE_INTERVAL, maintenance.clone()),
     );
     tokio::spawn(store.clone().flush_loop(flush_every, maintenance.clone()));
+    // TSP relationship store maintenance: log what survived the restart, write
+    // its own debounced snapshot, and sweep idle relationships (7-day default)
+    // so an invite that is never followed up doesn't accumulate forever.
+    // Spawned once here (not per mediator reconnect), since it holds the store
+    // and does not depend on the mediator socket.
+    if let Some(relationships) = &tsp_relationships {
+        tokio::spawn(
+            relationships
+                .backend()
+                .file_store()
+                .flush_loop(flush_every, maintenance.clone()),
+        );
+        tokio::spawn(vti_push_gateway::relationships::maintenance_loop(
+            relationships.clone(),
+            maintenance.clone(),
+        ));
+    }
     {
         let limits = limits.clone();
         let shutdown = maintenance.clone();
@@ -449,6 +486,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     maintenance.cancel();
     didcomm_shutdown.cancel();
     store.flush();
+    if let Some(relationships) = &tsp_relationships {
+        relationships.backend().flush();
+    }
     Ok(())
 }
 

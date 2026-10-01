@@ -96,6 +96,7 @@ async fn test_state() -> AppState {
         controllers: Arc::new(vti_push_gateway::controllers::ControllerPolicy::Open),
         proofs: ProofVerifier::new(Arc::new(client)),
         gateway_did: Some(GATEWAY_DID.into()),
+        tsp_relationships: None,
     }
 }
 

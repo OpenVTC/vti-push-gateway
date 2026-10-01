@@ -76,6 +76,7 @@ async fn state_with(store: Store, limits: Limits) -> AppState {
                 .expect("resolver"),
         )),
         gateway_did: Some(GATEWAY_DID.into()),
+        tsp_relationships: None,
     }
 }
 

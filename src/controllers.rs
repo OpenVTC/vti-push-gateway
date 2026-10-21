@@ -16,6 +16,7 @@
 //!   the replay record's per-issuer, per-handle and fair-share budgets) still
 //!   applies.
 
+use affinidi_did_common::scid::strip_scid_src;
 use std::collections::HashSet;
 
 /// Env var holding the controller allowlist.
@@ -51,6 +52,9 @@ impl ControllerPolicy {
         }
         let mut set = HashSet::new();
         for e in entries {
+            // A did:scid controller is listed by its DID: a `?src=` locator
+            // says where to fetch it, not who it is (VTI-KEY-160).
+            let e = &*strip_scid_src(e);
             if e == "*" {
                 return Err(format!(
                     "{ENV_ALLOWED_CONTROLLERS}: `*` must stand alone (open mode), not in a list"
@@ -61,7 +65,7 @@ impl ControllerPolicy {
                     "{ENV_ALLOWED_CONTROLLERS}: `{e}` — patterns are not supported; list exact DIDs"
                 ));
             }
-            if !e.starts_with("did:") || e.contains('#') || e.len() > 512 {
+            if !e.starts_with("did:") || e.contains(['#', '?']) || e.len() > 512 {
                 return Err(format!(
                     "{ENV_ALLOWED_CONTROLLERS}: `{e}` is not a controller DID"
                 ));
@@ -85,7 +89,7 @@ impl ControllerPolicy {
     pub fn allows(&self, did: &str) -> bool {
         match self {
             Self::Open => true,
-            Self::Listed(set) => set.contains(did),
+            Self::Listed(set) => set.contains(&*strip_scid_src(did)),
         }
     }
 
@@ -109,6 +113,18 @@ mod tests {
             assert!(!p.allows("did:web:vta.example"));
             assert_eq!(p, ControllerPolicy::default());
         }
+    }
+
+    #[test]
+    fn a_did_scid_controller_is_listed_by_its_did() {
+        let p = ControllerPolicy::parse(Some("did:scid:vh:1:QmScid?src=vta.example")).unwrap();
+        assert_eq!(p, ControllerPolicy::listing(["did:scid:vh:1:QmScid"]));
+        assert!(p.allows("did:scid:vh:1:QmScid"));
+        assert!(p.allows("did:scid:vh:1:QmScid?src=moved.example"));
+        assert!(!p.allows("did:webvh:QmScid:vta.example"));
+        // Only the `src` locator is not part of the DID.
+        assert!(ControllerPolicy::parse(Some("did:scid:vh:1:QmScid?versionId=2")).is_err());
+        assert!(ControllerPolicy::parse(Some("did:web:a.example?x=1")).is_err());
     }
 
     #[test]

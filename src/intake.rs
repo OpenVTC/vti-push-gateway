@@ -40,6 +40,7 @@
 //! document's recipient, so it accepts no authenticated document: it serves
 //! `push/register` only.
 
+use affinidi_did_common::scid::same_reference;
 use serde_json::Value;
 use trust_tasks_rs::{
     document_digest, ConsistencyError, DocumentDigest, FreshnessPolicy, RejectReason, TrustTask,
@@ -64,7 +65,7 @@ pub async fn authenticate(
 ) -> Result<Option<String>, RejectReason> {
     let gateway_did = state.gateway_did.as_deref();
     if let Some(recipient) = body.get("recipient").and_then(Value::as_str) {
-        if Some(recipient) != gateway_did {
+        if !gateway_did.is_some_and(|did| same_reference(recipient, did)) {
             return Err(RejectReason::WrongRecipient {
                 in_band: recipient.to_string(),
                 expected: gateway_did.unwrap_or(&state.gateway_addr).to_string(),
@@ -91,7 +92,9 @@ pub async fn authenticate(
     }
     if let Some(from) = transport_sender {
         let from_did = from.split('#').next().unwrap_or(from);
-        if from_did != issuer {
+        // `issuer` is the bare identity; a did:scid transport sender may still
+        // carry its `?src=` locator.
+        if !same_reference(from_did, &issuer) {
             return Err(RejectReason::IdentityMismatch(
                 ConsistencyError::IssuerMismatch {
                     in_band: issuer,

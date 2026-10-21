@@ -68,6 +68,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # the patch stops a fresh `cargo update` from resolving back under it.
 # 0.8.39 is the floor now: earlier releases resolve a deactivated did:webvh to its last document (SEC-4045 / VGI-04).
 affinidi-did-resolver-cache-sdk = { version = "0.8.39", features = ["network"] }
+# did:scid identities (VTI-KEY-160): `scid::strip_scid_src` / `same_reference`
+# compare a DID URL carrying a `?src=` locator by its DID. Needs 0.4.4.
+affinidi-did-common = "0.4"
 tokio-util = "0.7"
 # Async push senders (real delivery — Web Push / APNs — is async HTTP).
 async-trait = "0.1"
@@ -116,3 +119,4 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # Paused-clock tests for the wake send timeout.
 tokio = { version = "1", features = ["test-util"] }
+

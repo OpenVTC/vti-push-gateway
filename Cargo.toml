@@ -67,10 +67,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # so resolving below this floor would reintroduce a resolver-side SSRF. Pinning
 # the patch stops a fresh `cargo update` from resolving back under it.
 # 0.8.39 is the floor now: earlier releases resolve a deactivated did:webvh to its last document (SEC-4045 / VGI-04).
-affinidi-did-resolver-cache-sdk = { version = "0.8.39", features = ["network"] }
+affinidi-did-resolver-cache-sdk = { version = "0.8.42", features = ["network"] }
 # did:scid identities (VTI-KEY-160): `scid::strip_scid_src` / `same_reference`
 # compare a DID URL carrying a `?src=` locator by its DID. Needs 0.4.4.
-affinidi-did-common = "0.4"
+affinidi-did-common = "0.4.4"
 tokio-util = "0.7"
 # Async push senders (real delivery — Web Push / APNs — is async HTTP).
 async-trait = "0.1"

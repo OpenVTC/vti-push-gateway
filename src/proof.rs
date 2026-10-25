@@ -47,6 +47,7 @@ use std::sync::Arc;
 
 use affinidi_data_integrity::crypto_suites::CryptoSuite;
 use affinidi_data_integrity::{DataIntegrityError, DataIntegrityProof, ResolvedKey, VerifyOptions};
+use affinidi_did_common::scid::{same_reference, strip_scid_src};
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
 use affinidi_secrets_resolver::secrets::KeyType;
 use async_trait::async_trait;
@@ -124,6 +125,8 @@ impl ProofVerifier {
         let (vm_did, fragment) = vm
             .split_once('#')
             .ok_or_else(|| invalid("proof verificationMethod is not a DID URL with a fragment"))?;
+        // Exact (Trust Tasks SPEC §4.8): a did:scid producer writes its issuer
+        // and its method in the same form (VTI-KEY-163).
         if vm_did != issuer || fragment.is_empty() {
             return Err(invalid(
                 "proof verificationMethod is not controlled by the document issuer",
@@ -150,7 +153,10 @@ impl ProofVerifier {
                     _ => invalid("proof signature does not verify"),
                 }
             })?;
-        Ok(issuer.to_string())
+        // The issuer's identity: a did:scid issuer may present its DID with a
+        // `?src=` locator so the gateway can resolve it, but it is known by
+        // the bare DID (VTI-KEY-160).
+        Ok(strip_scid_src(issuer).into_owned())
     }
 }
 
@@ -225,10 +231,17 @@ pub(crate) fn key_for_purpose_in(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<ResolvedKey, ProofError> {
     let relationship = purpose.as_str();
-    if doc.get("id").and_then(Value::as_str) != Some(issuer) {
+    // A did:scid issuer's document lists itself, and its keys, under the bare
+    // DID, while `issuer` and `vm` may carry the `?src=` locator it was
+    // resolved through; they are compared by DID (VTI-KEY-163).
+    if !doc
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| same_reference(id, issuer))
+    {
         return Err(invalid("resolved DID document is not the issuer's"));
     }
-    let same_vm = |id: &str| absolute(issuer, id) == vm;
+    let same_vm = |id: &str| same_reference(&absolute(issuer, id), vm);
 
     let method = doc
         .get("verificationMethod")
@@ -249,7 +262,11 @@ pub(crate) fn key_for_purpose_in(
             invalid("issuer DID document does not list the proof's verificationMethod")
         })?;
 
-    if method.get("controller").and_then(Value::as_str) != Some(issuer) {
+    if !method
+        .get("controller")
+        .and_then(Value::as_str)
+        .is_some_and(|controller| same_reference(controller, issuer))
+    {
         return Err(invalid(
             "the proof's verificationMethod is not controlled by the issuer",
         ));
@@ -338,6 +355,39 @@ mod tests {
         let d = doc(vm(DID), json!(["#key-0"]));
         assert!(
             authentication_key_in(&d, DID, &format!("{DID}#key-0"), chrono::Utc::now()).is_ok()
+        );
+    }
+
+    /// A did:scid issuer's document is its own: the id and keys are under the
+    /// bare DID, while the issuer and the proof's method may carry the `?src=`
+    /// locator they were resolved through.
+    #[test]
+    fn accepts_a_did_scid_issuer_with_or_without_its_locator() {
+        let bare = "did:scid:vh:1:QmScid";
+        let d = json!({
+            "id": bare,
+            "verificationMethod": [{ "id": format!("{bare}#key-0"), "type": "Multikey",
+                "controller": bare, "publicKeyMultibase": KEY_MB }],
+            "authentication": [format!("{bare}#key-0")],
+        });
+        for issuer in [bare, "did:scid:vh:1:QmScid?src=vta.example"] {
+            let vm = format!("{issuer}#key-0");
+            assert!(
+                authentication_key_in(&d, issuer, &vm, chrono::Utc::now()).is_ok(),
+                "{issuer}"
+            );
+        }
+    }
+
+    /// The did:webvh document that verifies a did:scid is not the did:scid's:
+    /// a resolver that returned it has not resolved the issuer.
+    #[test]
+    fn refuses_a_did_scid_issuer_whose_document_is_the_did_webvh() {
+        let d = doc(vm(DID), json!([format!("{DID}#key-0")]));
+        let issuer = "did:scid:vh:1:scid?src=vta.example";
+        assert!(
+            authentication_key_in(&d, issuer, &format!("{issuer}#key-0"), chrono::Utc::now())
+                .is_err()
         );
     }
 

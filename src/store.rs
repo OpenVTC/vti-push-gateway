@@ -43,6 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use affinidi_did_common::scid::{same_reference, strip_scid_src};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -423,6 +424,10 @@ impl Store {
         controller_vta_did: String,
         created_at: u64,
     ) -> Result<(), InsertError> {
+        // Stored by identity: a did:scid controller's `?src=` locator is not
+        // part of who it is (VTI-KEY-160), and the proven caller it is later
+        // compared with is the bare DID.
+        let controller_vta_did = strip_scid_src(&controller_vta_did).into_owned();
         let mut state = self.state.write().unwrap();
         if state.handles.len() >= self.limits.max_handles {
             return Err(InsertError::AtCapacity);
@@ -468,7 +473,9 @@ impl Store {
         let mut state = self.state.write().unwrap();
         let outcome = match state.handles.get_mut(handle) {
             None => ProvisionOutcome::UnknownHandle,
-            Some(rec) if rec.controller_vta_did != caller_did => ProvisionOutcome::NotController,
+            Some(rec) if !same_reference(&rec.controller_vta_did, caller_did) => {
+                ProvisionOutcome::NotController
+            }
             Some(rec) => {
                 rec.allowed_triggers = policy.allowed_triggers;
                 ProvisionOutcome::Ok
@@ -497,7 +504,9 @@ impl Store {
         let state = self.state.read().unwrap();
         match state.handles.get(handle) {
             None => ProvisionOutcome::UnknownHandle,
-            Some(rec) if rec.controller_vta_did != caller_did => ProvisionOutcome::NotController,
+            Some(rec) if !same_reference(&rec.controller_vta_did, caller_did) => {
+                ProvisionOutcome::NotController
+            }
             Some(_) => ProvisionOutcome::Ok,
         }
     }
@@ -901,6 +910,29 @@ mod tests {
         assert!(matches!(
             store.authorize_wake("old-unprovisioned", "did:key:zT"),
             WakeAuthz::UnknownHandle
+        ));
+    }
+
+    /// A did:scid controller is stored and matched by its DID: the `?src=` it
+    /// was named with at registration says where to fetch it, not who it is.
+    #[test]
+    fn a_did_scid_controller_is_matched_by_its_did() {
+        let store = Store::default();
+        let named = "did:scid:vh:1:QmScid?src=vta.example/a";
+        store.insert("h".into(), apns("ab"), named.into()).unwrap();
+        for caller in [
+            "did:scid:vh:1:QmScid",
+            named,
+            "did:scid:vh:1:QmScid?src=moved.example",
+        ] {
+            assert!(
+                matches!(store.check_controller("h", caller), ProvisionOutcome::Ok),
+                "{caller}"
+            );
+        }
+        assert!(matches!(
+            store.check_controller("h", "did:webvh:QmScid:vta.example:a"),
+            ProvisionOutcome::NotController
         ));
     }
 

@@ -28,11 +28,13 @@ rand = "0.10"
 # control plane is the push/* Trust Task family). The gateway accepts
 # push/register|provision|wake documents over every transport it serves
 # (TSP, DIDComm, HTTPS), all through one intake (src/intake.rs).
-trust-tasks-rs = { version = "0.24.2", default-features = false }
+# No spec families are enabled: the push/* bodies are modelled in src/types.rs,
+# so none of 0.36's deprecated prebuilt `specs::` modules is used.
+trust-tasks-rs = { version = "0.36.1", default-features = false }
 # The proof-purpose contract for a document's Data Integrity proof:
 # `ProofPurposeResolver` releases a key only for the relationship the proof
 # declares, and `PurposeBound` applies it when verifying (src/proof.rs).
-trust-tasks-proof = "0.24.2"
+trust-tasks-proof = "0.36.1"
 # Response document ids (urn:uuid).
 uuid = { version = "1", features = ["v4"] }
 # DIDComm server transport (the preferred transport). Mirrors vta-service:
@@ -45,18 +47,21 @@ uuid = { version = "1", features = ["v4"] }
 # (src/tsp.rs). `affinidi-tdk/tsp` also forwards the messaging SDK's own `tsp`
 # ops (relationship accept) and re-exports `affinidi-tsp` as
 # `affinidi_tdk::tsp` — the same pair VTI's VTA and VTC enable.
-affinidi-messaging-didcomm-service = { version = "0.15.1", features = ["tsp"] }
-affinidi-tdk = { version = "0.20", features = ["tsp"] }
+# These move in lockstep with `trust-tasks-rs`: didcomm-service 0.29 and
+# affinidi-tdk 0.36 are on `affinidi-messaging-sdk` 0.44 and `trust-tasks-rs`
+# 0.36, so the graph holds one `trust-tasks-rs` (the same set VTI is on).
+affinidi-messaging-didcomm-service = { version = "0.29.0", features = ["tsp"] }
+affinidi-tdk = { version = "0.36", features = ["tsp"] }
 # The TSP Trust Task binding (https://trusttasks.org/binding/tsp/0.1): its
 # envelope type, so the gateway opens and wraps the same
 # `{"type": …/envelope, "document": …}` payload the rest of the stack sends.
-trust-tasks-tsp = { version = "0.24.2", default-features = false }
-affinidi-secrets-resolver = "0.5.12"
+trust-tasks-tsp = { version = "0.36.1", default-features = false }
+affinidi-secrets-resolver = "0.5.15"
 # Data Integrity (`eddsa-jcs-2022`) verification of the proof a `push/provision`
 # or `push/wake` document carries, on every transport — the caller is the
 # document issuer that proof establishes, not the transport's sender
 # (src/proof.rs). Also signs the `test-wake*` helpers' documents.
-affinidi-data-integrity = "0.7.13"
+affinidi-data-integrity = "0.8.0"
 # The acceptance window for a document's `issuedAt` and the retention of the
 # replay record (src/intake.rs). Already in the tree via trust-tasks-rs.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -67,7 +72,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # so resolving below this floor would reintroduce a resolver-side SSRF. Pinning
 # the patch stops a fresh `cargo update` from resolving back under it.
 # 0.8.39 is the floor now: earlier releases resolve a deactivated did:webvh to its last document (SEC-4045 / VGI-04).
-affinidi-did-resolver-cache-sdk = { version = "0.8.42", features = ["network"] }
+affinidi-did-resolver-cache-sdk = { version = "0.8.43", features = ["network"] }
 # did:scid identities (VTI-KEY-160): `scid::strip_scid_src` / `same_reference`
 # compare a DID URL carrying a `?src=` locator by its DID. Needs 0.4.4.
 affinidi-did-common = "0.4.4"

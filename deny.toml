@@ -15,12 +15,15 @@
 # is how RUSTSEC-2024-0370 (proc-macro-error unmaintained) left this list: it
 # said "revisit when the affinidi crates drop it", and `affinidi-tdk` 0.8 did.
 ignore = [
-  # rustls-pemfile is unmaintained (RUSTSEC-2025-0134). Pulled transitively by
-  # the Affinidi stack (affinidi-messaging-sdk and affinidi-tdk-common), not
-  # selected by anything here, and the advisory is "unmaintained", not a
-  # vulnerability. Revisit when the affinidi crates move to rustls-pki-types'
-  # built-in PEM parsing.
-  "RUSTSEC-2025-0134",
+  # crypto-bigint: secret-dependent branches in operations meant to be
+  # constant-time (RUSTSEC-2026-0387). Patched only in >= 0.7.6, which
+  # Cargo.lock takes for the 0.7 line; there is no fixed 0.5 release. The
+  # residue is 0.5.5, reached only through elliptic-curve 0.13 under p256 0.13 —
+  # the curve the gateway signs VAPID (ES256) with and web-push-native encrypts
+  # Web Push payloads with. web-push-native requires p256 ^0.13 in every release
+  # through 0.5.0, so the gateway cannot leave 0.13 on its own. Remove when
+  # web-push-native moves to p256 0.14, and move the VAPID signer with it.
+  "RUSTSEC-2026-0387",
 ]
 
 [licenses]

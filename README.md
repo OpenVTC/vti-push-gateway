@@ -95,6 +95,9 @@ resolution fetches a verifiable log over HTTPS — slower than `did:key`/`did:we
 yet rarely changing). Defaults raise the SDK's stock 300 s TTL / 5 s timeout to
 a 250-entry cache, **900 s** TTL, **10 s** timeout; override via the
 `GATEWAY_DID_*` env vars below, or point at a remote resolver service.
+Besides `did:key`, `did:peer`, `did:web`, `did:webvh` and `did:scid`, it resolves
+`did:webs` (VTI-KEY-003), verified against the identifier's KERI key event log,
+so a VTA or device may hold a DID of any of these methods.
 
 Roadmap: the gateway is feature-complete (transports · senders · durable
 registry · metrics · resolver tuning).
@@ -308,7 +311,7 @@ cargo run
 # GATEWAY_DID_NETWORK_TIMEOUT_MS=10000  per-resolution timeout (SDK default 5000)
 # GATEWAY_DID_RESOLVER_URL=wss://…      resolve via a remote resolver service
 #                       instead of locally (unset = local resolution)
-# GATEWAY_DID_ALLOW_PRIVATE_HOSTS=1     let did:web/did:webvh resolution reach
+# GATEWAY_DID_ALLOW_PRIVATE_HOSTS=1     let did:web/did:webvh/did:scid/did:webs reach
 #                       non-public hosts (loopback, RFC 1918, link-local).
 #                       Default off: a DID names the host its document is
 #                       fetched from, and inbound DIDComm senders choose the

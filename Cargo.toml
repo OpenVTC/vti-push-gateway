@@ -137,5 +137,5 @@ tokio = { version = "1", features = ["test-util"] }
 # Creates a did:webs for a local fixture server in tests/did_webs.rs, so its
 # resolution is tested offline. `create` builds on `affinidi-keri` with its
 # default features off, so the test graph gains no LMDB either.
-affinidi-did-webs = { version = "0.13.2", features = ["create"] }
+affinidi-did-webs = { version = "0.13.3", features = ["create"] }
 

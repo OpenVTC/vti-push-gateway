@@ -72,7 +72,17 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # so resolving below this floor would reintroduce a resolver-side SSRF. Pinning
 # the patch stops a fresh `cargo update` from resolving back under it.
 # 0.8.39 is the floor now: earlier releases resolve a deactivated did:webvh to its last document (SEC-4045 / VGI-04).
-affinidi-did-resolver-cache-sdk = { version = "0.8.43", features = ["network"] }
+# `did-webs` (VTI-KEY-003): every VTI node resolves did:webs, so a VTA or device
+# whose DID is a did:webs can provision and wake. It is verified against its KERI
+# key event log, under the same host policy as did:web/did:webvh/did:scid. The
+# floor is 0.8.52, the release on `affinidi-did-webs` 0.13: 0.8.46 was the first
+# did:webs release to honour the host policy (earlier ones fetched any host the
+# DID named), and 0.8.50 (did-webs 0.12) stops counting what only superseded
+# interaction events anchored after a recovery rotation. The resolver side of
+# did-webs needs no `affinidi-keri` and so no LMDB. The feature reaches every
+# resolver in the gateway — the proof verifier's, the TSP self-check's and the
+# DIDComm listener's (`TDKConfig`) — because the graph holds one copy of this crate.
+affinidi-did-resolver-cache-sdk = { version = "0.8.52", features = ["network", "did-webs"] }
 # did:scid identities (VTI-KEY-160): `scid::strip_scid_src` / `same_reference`
 # compare a DID URL carrying a `?src=` locator by its DID. Needs 0.4.4.
 affinidi-did-common = "0.4.4"
@@ -124,4 +134,8 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 # Paused-clock tests for the wake send timeout.
 tokio = { version = "1", features = ["test-util"] }
+# Creates a did:webs for a local fixture server in tests/did_webs.rs, so its
+# resolution is tested offline. `create` builds on `affinidi-keri` with its
+# default features off, so the test graph gains no LMDB either.
+affinidi-did-webs = { version = "0.13.2", features = ["create"] }
 

@@ -11,9 +11,9 @@
 //!
 //! ## Which hosts resolution may contact
 //!
-//! A `did:web`/`did:webvh` identifier *is* a network location: everything after
-//! the method prefix is the host the DID document (or verifiable log) is fetched
-//! from. A `did:scid:vh:1` DID URL names its host in `?src=`, and the SDK applies
+//! A `did:web`/`did:webvh`/`did:webs` identifier *is* a network location:
+//! everything after the method prefix is the host the DID document (or
+//! verifiable log, or KERI key event log) is fetched from. A `did:scid:vh:1` DID URL names its host in `?src=`, and the SDK applies
 //! the same policy to it. On the DIDComm path the gateway resolves DIDs it did not choose — every
 //! authcrypt sender that reaches it through the mediator — so an inbound message
 //! naming `did:webvh:{SCID}:169.254.169.254` or an internal host would otherwise
@@ -33,7 +33,7 @@
 //! - `GATEWAY_DID_NETWORK_TIMEOUT_MS` — per-resolution timeout (default 10000)
 //! - `GATEWAY_DID_RESOLVER_URL`     — resolve via a remote resolver service
 //!   (`ws[s]://…`) instead of locally; unset = local resolution.
-//! - `GATEWAY_DID_ALLOW_PRIVATE_HOSTS` — allow did:web/did:webvh/did:scid
+//! - `GATEWAY_DID_ALLOW_PRIVATE_HOSTS` — allow did:web/did:webvh/did:scid/did:webs
 //!   resolution to non-public hosts (default off). For local stacks only.
 
 use affinidi_did_resolver_cache_sdk::config::{DIDCacheConfig, DIDCacheConfigBuilder};
@@ -51,7 +51,7 @@ pub struct ResolverTuning {
     pub network_timeout_ms: u32,
     /// Remote resolver service address (`ws[s]://…`); `None` = local resolution.
     pub service_address: Option<String>,
-    /// Whether did:web/did:webvh/did:scid resolution may contact non-public hosts.
+    /// Whether did:web/did:webvh/did:scid/did:webs resolution may contact non-public hosts.
     /// `false` (the default) is [`HostPolicy::PublicOnly`].
     pub allow_private_did_hosts: bool,
 }

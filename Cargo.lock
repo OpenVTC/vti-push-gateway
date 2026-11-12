@@ -237,9 +237,9 @@ dependencies = [
 
 [[package]]
 name = "affinidi-did-webs"
-version = "0.13.2"
+version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f882dd461f6e2905ca1704cc8302821689d85738268da479796eb803ce14a4f5"
+checksum = "eb43cbaadbd39874aa24bc26a49e33b760f2717dea014c6f310540bc26d01110"
 dependencies = [
  "affinidi-cesr",
  "affinidi-crypto",
@@ -256,6 +256,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio",
  "tracing",
 ]
 

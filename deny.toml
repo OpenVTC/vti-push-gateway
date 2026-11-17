@@ -24,6 +24,12 @@ ignore = [
   # through 0.5.0, so the gateway cannot leave 0.13 on its own. Remove when
   # web-push-native moves to p256 0.14, and move the VAPID signer with it.
   "RUSTSEC-2026-0387",
+  # chrono is unmaintained (RUSTSEC-2026-0543, chronotope/chrono#1768): status
+  # only, no vulnerability, every version affected, no fixed release. It is
+  # used directly here and arrives again through the affinidi-tdk stack, so it
+  # cannot leave the graph from this repo alone. Remove when this crate and
+  # affinidi-tdk-rs have migrated to `jiff` or `time`.
+  "RUSTSEC-2026-0543",
 ]
 
 [licenses]

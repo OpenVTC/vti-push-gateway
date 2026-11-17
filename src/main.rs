@@ -38,6 +38,53 @@ use vti_push_gateway::sender::{
 };
 use vti_push_gateway::store::{Store, StoreLimits};
 
+// ─── Allocator ──────────────────────────────────────────────────────────────
+//
+// Set on the binary only. A library that installs a #[global_allocator] forces
+// it on every consumer, so this deliberately does not live in lib.rs.
+//
+// Why not the system allocator: the gateway churns short-lived buffers (Trust
+// Task documents, DIDComm/TSP frames, push payloads). glibc malloc keeps those
+// arenas rather than returning them, so RSS ratchets to the high-water mark and
+// never falls back — indistinguishable from a leak on a memory graph.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// jemalloc tuning, read by jemalloc itself at startup via this well-known symbol.
+///
+/// `background_thread:true` runs the purger off the request path.
+/// `dirty_decay_ms` / `muzzy_decay_ms` are how long freed pages linger before
+/// being returned to the OS; jemalloc's defaults (10s / 10s) are tuned for
+/// throughput on allocation-heavy workloads, and hold RSS well above the live
+/// heap. 5s keeps the memory graph honest at a negligible cost here, because
+/// the gateway's hot path is I/O-bound, not allocation-bound.
+///
+/// Raise these (or drop the `jemalloc` feature) if you are optimising for
+/// allocation throughput over resident footprint.
+///
+/// The symbol must be `_rjem_malloc_conf`, not jemalloc's documented
+/// `malloc_conf`: `tikv-jemalloc-sys` (default features) configures jemalloc
+/// with `--with-jemalloc-prefix=_rjem_`, so every public jemalloc symbol —
+/// including the config it reads at startup — carries that prefix. Exporting
+/// the unprefixed name compiles and links fine but is silently ignored.
+///
+/// The type is a reference to a fixed-size array, not a slice: `&[u8; 63]` is a
+/// thin pointer, matching jemalloc's `const char *malloc_conf`, whereas a
+/// `&[u8]` slice reference is a two-word fat pointer (pointer + length) that C
+/// would misread.
+///
+/// SAFETY: exporting a symbol is unsafe because it could clash with another
+/// definition of the same name. `_rjem_malloc_conf` is the (prefixed) name
+/// jemalloc reads for exactly this, it is defined once (in the binary, never
+/// the library), and the value is the NUL-terminated static string jemalloc
+/// expects.
+#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+#[allow(unsafe_code)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8; 63] =
+    b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
+
 /// Registry caps and the unprovisioned-handle TTL.
 const ENV_MAX_HANDLES: &str = "GATEWAY_MAX_HANDLES";
 const ENV_MAX_PER_TOKEN: &str = "GATEWAY_MAX_HANDLES_PER_TOKEN";

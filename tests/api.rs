@@ -7,22 +7,22 @@
 use std::sync::Arc;
 
 use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
-use affinidi_did_resolver_cache_sdk::{config::DIDCacheConfigBuilder, DIDCacheClient};
+use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_secrets_resolver::secrets::Secret;
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
 use ed25519_dalek::SigningKey;
 use http_body_util::BodyExt;
 use rand::Rng;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tower::ServiceExt;
 
-use vti_push_gateway::api::{metrics_router, router, AppState, DEFAULT_METRICS_BIND};
+use vti_push_gateway::api::{AppState, DEFAULT_METRICS_BIND, metrics_router, router};
 use vti_push_gateway::egress::EgressPolicy;
-use vti_push_gateway::limits::{Limits, RateConfig, DEFAULT_HTTP, DEFAULT_PER_DID};
+use vti_push_gateway::limits::{DEFAULT_HTTP, DEFAULT_PER_DID, Limits, RateConfig};
 use vti_push_gateway::proof::ProofVerifier;
-use vti_push_gateway::sender::{generate_vapid_keypair, EchoSender, PushSender, SendOutcome};
+use vti_push_gateway::sender::{EchoSender, PushSender, SendOutcome, generate_vapid_keypair};
 use vti_push_gateway::store::{Store, StoreLimits};
 use vti_push_gateway::types::{PushRegistration, WakeTriggerPolicy, WebPushKeys};
 
@@ -581,9 +581,11 @@ async fn register_rejects_invalid_fields() {
         );
         let out = body_json(app.clone().oneshot(post(&doc, None).await).await.unwrap()).await;
         assert!(!is_success(&out), "must be rejected: {reg_is} → {out}");
-        assert!(metrics_text(&metrics_app)
-            .await
-            .contains("gateway_register_total 0\n"));
+        assert!(
+            metrics_text(&metrics_app)
+                .await
+                .contains("gateway_register_total 0\n")
+        );
     }
 
     // A controllerVtaDid that is not a DID is refused even with a valid endpoint.

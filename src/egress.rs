@@ -558,9 +558,10 @@ mod tests {
         assert!(test.validate_webpush_endpoint(raw).is_ok());
         // Non-loopback literals stay refused even in the test policy.
         assert!(test.validate_webpush_endpoint("http://10.0.0.1/").is_err());
-        assert!(test
-            .validate_webpush_endpoint("https://169.254.169.254/")
-            .is_err());
+        assert!(
+            test.validate_webpush_endpoint("https://169.254.169.254/")
+                .is_err()
+        );
     }
 
     #[test]
@@ -644,24 +645,29 @@ mod tests {
         let hosts = p.webpush_hosts();
         assert!(hosts.contains(&"fcm.googleapis.com".to_string()));
         assert!(hosts.contains(&"*.up.example.net".to_string()));
-        assert!(p
-            .validate_webpush_endpoint("https://push.example.org/x")
-            .is_ok());
-        assert!(p
-            .validate_webpush_endpoint("https://a.up.example.net/x")
-            .is_ok());
-        assert!(p
-            .validate_webpush_endpoint("https://up.example.net/x")
-            .is_err());
-        assert!(p
-            .validate_webpush_endpoint("https://aup.example.net/x")
-            .is_err());
+        assert!(
+            p.validate_webpush_endpoint("https://push.example.org/x")
+                .is_ok()
+        );
+        assert!(
+            p.validate_webpush_endpoint("https://a.up.example.net/x")
+                .is_ok()
+        );
+        assert!(
+            p.validate_webpush_endpoint("https://up.example.net/x")
+                .is_err()
+        );
+        assert!(
+            p.validate_webpush_endpoint("https://aup.example.net/x")
+                .is_err()
+        );
 
         // Without @default the built-ins are not included.
         let p = EgressPolicy::from_config(Some("push.example.org"), None).unwrap();
-        assert!(p
-            .validate_webpush_endpoint("https://fcm.googleapis.com/x")
-            .is_err());
+        assert!(
+            p.validate_webpush_endpoint("https://fcm.googleapis.com/x")
+                .is_err()
+        );
 
         for bad in [
             "*.com",
@@ -747,8 +753,8 @@ mod tests {
     /// `is_public_ip_table`, which opens no socket at all.
     #[tokio::test]
     async fn hardened_client_refuses_a_name_that_resolves_to_loopback() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Instant;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

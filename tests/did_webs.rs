@@ -8,15 +8,15 @@
 //! the way `main.rs` builds the gateway's — from [`ResolverTuning`].
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use affinidi_did_resolver_cache_sdk::DIDCacheClient;
-use affinidi_did_webs::create::{create, CreateConfig};
 use affinidi_did_webs::DidWebs;
-use axum::routing::get;
+use affinidi_did_webs::create::{CreateConfig, create};
 use axum::Router;
+use axum::routing::get;
 
 use vti_push_gateway::resolver::ResolverTuning;
 

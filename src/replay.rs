@@ -129,7 +129,16 @@ impl ReplayRecord {
             .entry(issuer.to_string())
             // Capacity one above the bound, so the guard itself never evicts:
             // the bound is enforced here, by refusing.
-            .or_insert_with(|| Arc::new(InMemoryReplayGuard::new(self.per_issuer + 1)))
+            // Each guard is already one issuer's partition, so its own
+            // per-issuer share (a tenth of the capacity by default, from
+            // trust-tasks-rs 0.41) is lifted to the whole guard: the bounds are
+            // the ones this record enforces above.
+            .or_insert_with(|| {
+                Arc::new(
+                    InMemoryReplayGuard::new(self.per_issuer + 1)
+                        .with_per_issuer_limit(self.per_issuer + 1),
+                )
+            })
             .clone();
         let held = guard.len();
         let fair_share = (self.total / active.max(1)).max(1);
@@ -259,10 +268,11 @@ mod tests {
                 Ok(Admission::Fresh)
             );
         }
-        assert!(r
-            .claim("did:d", "h", "9", &digest("9"), until, now)
-            .await
-            .is_err());
+        assert!(
+            r.claim("did:d", "h", "9", &digest("9"), until, now)
+                .await
+                .is_err()
+        );
         // Another handle is unaffected, and a released claim frees its slot.
         assert_eq!(
             r.claim("did:d", "h2", "9", &digest("9"), until, now).await,
@@ -286,10 +296,11 @@ mod tests {
             );
         }
         // Full: the flooder, far over its share, is refused ...
-        assert!(r
-            .claim("did:flood", "x", "x", &digest("x"), until, now)
-            .await
-            .is_err());
+        assert!(
+            r.claim("did:flood", "x", "x", &digest("x"), until, now)
+                .await
+                .is_err()
+        );
         // ... and a newcomer, under its share, is admitted.
         assert_eq!(
             r.claim("did:new", "y", "y", &digest("y"), until, now).await,
@@ -298,7 +309,7 @@ mod tests {
     }
 
     use super::*;
-    use trust_tasks_rs::{document_digest, TrustTask};
+    use trust_tasks_rs::{TrustTask, document_digest};
 
     fn digest(id: &str) -> DocumentDigest {
         let doc: TrustTask<Value> = serde_json::from_value(serde_json::json!({
@@ -335,10 +346,11 @@ mod tests {
                 Ok(Admission::Fresh)
             );
         }
-        assert!(r
-            .claim("did:a", "3", "3", &digest("3"), until, now)
-            .await
-            .is_err());
+        assert!(
+            r.claim("did:a", "3", "3", &digest("3"), until, now)
+                .await
+                .is_err()
+        );
         assert_eq!(r.len_for("did:a"), 2, "nothing was evicted");
         // Another issuer is unaffected.
         assert_eq!(

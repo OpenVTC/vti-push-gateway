@@ -25,16 +25,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
 use vti_push_gateway::api::{self, AppState};
 use vti_push_gateway::didcomm;
-use vti_push_gateway::egress::{EgressPolicy, ENV_APNS_TOPICS};
+use vti_push_gateway::egress::{ENV_APNS_TOPICS, EgressPolicy};
 use vti_push_gateway::identity::GatewayIdentity;
 use vti_push_gateway::limits::Limits;
 use vti_push_gateway::secretfile;
 use vti_push_gateway::sender::{
-    generate_vapid_keypair, ApnsSender, EchoSender, FcmSender, PushSender, WebPushSender,
+    ApnsSender, EchoSender, FcmSender, PushSender, WebPushSender, generate_vapid_keypair,
 };
 use vti_push_gateway::store::{Store, StoreLimits};
 

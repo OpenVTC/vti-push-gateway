@@ -129,7 +129,16 @@ impl ReplayRecord {
             .entry(issuer.to_string())
             // Capacity one above the bound, so the guard itself never evicts:
             // the bound is enforced here, by refusing.
-            .or_insert_with(|| Arc::new(InMemoryReplayGuard::new(self.per_issuer + 1)))
+            // Each guard is already one issuer's partition, so its own
+            // per-issuer share (a tenth of the capacity by default, from
+            // trust-tasks-rs 0.41) is lifted to the whole guard: the bounds are
+            // the ones this record enforces above.
+            .or_insert_with(|| {
+                Arc::new(
+                    InMemoryReplayGuard::new(self.per_issuer + 1)
+                        .with_per_issuer_limit(self.per_issuer + 1),
+                )
+            })
             .clone();
         let held = guard.len();
         let fair_share = (self.total / active.max(1)).max(1);

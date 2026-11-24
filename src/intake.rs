@@ -43,10 +43,10 @@
 use affinidi_did_common::scid::same_reference;
 use serde_json::Value;
 use trust_tasks_rs::{
-    document_digest, ConsistencyError, DocumentDigest, FreshnessPolicy, RejectReason, TrustTask,
+    ConsistencyError, DocumentDigest, FreshnessPolicy, RejectReason, TrustTask, document_digest,
 };
 
-use crate::api::{dispatch_push, dispatch_push_once, reject_value, AdmitOnce, AppState};
+use crate::api::{AdmitOnce, AppState, dispatch_push, dispatch_push_once, reject_value};
 use crate::proof::ProofError;
 use crate::replay::{Admission, ReplayRecord};
 
@@ -64,13 +64,13 @@ pub async fn authenticate(
     body: &Value,
 ) -> Result<Option<String>, RejectReason> {
     let gateway_did = state.gateway_did.as_deref();
-    if let Some(recipient) = body.get("recipient").and_then(Value::as_str) {
-        if !gateway_did.is_some_and(|did| same_reference(recipient, did)) {
-            return Err(RejectReason::WrongRecipient {
-                in_band: recipient.to_string(),
-                expected: gateway_did.unwrap_or(&state.gateway_addr).to_string(),
-            });
-        }
+    if let Some(recipient) = body.get("recipient").and_then(Value::as_str)
+        && !gateway_did.is_some_and(|did| same_reference(recipient, did))
+    {
+        return Err(RejectReason::WrongRecipient {
+            in_band: recipient.to_string(),
+            expected: gateway_did.unwrap_or(&state.gateway_addr).to_string(),
+        });
     }
     let issuer = match state.proofs.verify_issuer(body).await {
         Ok(issuer) => issuer,

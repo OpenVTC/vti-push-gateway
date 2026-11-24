@@ -245,8 +245,10 @@ mod tests {
             ..ResolverTuning::default()
         };
         assert!(remote.tdk_config().is_ok());
-        assert!(remote
-            .summary()
-            .contains("resolver=wss://resolver.example/did/v1"));
+        assert!(
+            remote
+                .summary()
+                .contains("resolver=wss://resolver.example/did/v1")
+        );
     }
 }

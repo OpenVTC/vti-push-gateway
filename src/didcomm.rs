@@ -25,9 +25,9 @@
 //! survives a gateway restart instead of being wiped and forcing a re-invite.
 
 use affinidi_messaging_didcomm_service::{
-    handler_fn, ignore_handler, trust_ping_handler, DIDCommResponse, DIDCommService,
-    DIDCommServiceConfig, DIDCommServiceError, Extension, HandlerContext, ListenerConfig,
-    Protocols, RestartPolicy, RetryConfig, Router, MESSAGE_PICKUP_STATUS_TYPE, TRUST_PING_TYPE,
+    DIDCommResponse, DIDCommService, DIDCommServiceConfig, DIDCommServiceError, Extension,
+    HandlerContext, ListenerConfig, MESSAGE_PICKUP_STATUS_TYPE, Protocols, RestartPolicy,
+    RetryConfig, Router, TRUST_PING_TYPE, handler_fn, ignore_handler, trust_ping_handler,
 };
 
 use affinidi_tdk::common::profiles::TDKProfile;

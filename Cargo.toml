@@ -1,11 +1,11 @@
 [package]
 name = "vti-push-gateway"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "Apache-2.0"
 description = "Push wake-up gateway for the OpenVTC mobile authenticator. Holds the app's platform push credentials, issues opaque wake handles, enforces a VTA-provisioned trigger allowlist, and relays contentless wake notifications. Implements https://trusttasks.org/binding/push/0.1."
 repository = "https://github.com/OpenVTC/vti-push-gateway"
-rust-version = "1.85"
+rust-version = "1.95.0"
 
 [features]
 ## Use jemalloc as the binary's global allocator (see the dependency comment).
@@ -38,12 +38,12 @@ rand = "0.10"
 # push/register|provision|wake documents over every transport it serves
 # (TSP, DIDComm, HTTPS), all through one intake (src/intake.rs).
 # No spec families are enabled: the push/* bodies are modelled in src/types.rs,
-# so none of 0.36's deprecated prebuilt `specs::` modules is used.
-trust-tasks-rs = { version = "0.36.1", default-features = false }
+# so none of the deprecated prebuilt `specs::` modules is used.
+trust-tasks-rs = { version = "0.41.0", default-features = false }
 # The proof-purpose contract for a document's Data Integrity proof:
 # `ProofPurposeResolver` releases a key only for the relationship the proof
 # declares, and `PurposeBound` applies it when verifying (src/proof.rs).
-trust-tasks-proof = "0.36.1"
+trust-tasks-proof = "0.41.0"
 # Response document ids (urn:uuid).
 uuid = { version = "1", features = ["v4"] }
 # DIDComm server transport (the preferred transport). Mirrors vta-service:
@@ -56,21 +56,21 @@ uuid = { version = "1", features = ["v4"] }
 # (src/tsp.rs). `affinidi-tdk/tsp` also forwards the messaging SDK's own `tsp`
 # ops (relationship accept) and re-exports `affinidi-tsp` as
 # `affinidi_tdk::tsp` — the same pair VTI's VTA and VTC enable.
-# These move in lockstep with `trust-tasks-rs`: didcomm-service 0.29 and
-# affinidi-tdk 0.36 are on `affinidi-messaging-sdk` 0.44 and `trust-tasks-rs`
-# 0.36, so the graph holds one `trust-tasks-rs` (the same set VTI is on).
-affinidi-messaging-didcomm-service = { version = "0.29.0", features = ["tsp"] }
-affinidi-tdk = { version = "0.36", features = ["tsp"] }
+# These move in lockstep with `trust-tasks-rs`: didcomm-service 0.38 and
+# affinidi-tdk 0.49 are on `affinidi-messaging-sdk` 0.50 — the Fig set VTI is
+# on (vta-sdk 0.92, trust-tasks 0.41).
+affinidi-messaging-didcomm-service = { version = "0.38.0", features = ["tsp"] }
+affinidi-tdk = { version = "0.49", features = ["tsp"] }
 # The TSP Trust Task binding (https://trusttasks.org/binding/tsp/0.1): its
 # envelope type, so the gateway opens and wraps the same
 # `{"type": …/envelope, "document": …}` payload the rest of the stack sends.
-trust-tasks-tsp = { version = "0.36.1", default-features = false }
-affinidi-secrets-resolver = "0.5.15"
+trust-tasks-tsp = { version = "0.41.0", default-features = false }
+affinidi-secrets-resolver = "0.6"
 # Data Integrity (`eddsa-jcs-2022`) verification of the proof a `push/provision`
 # or `push/wake` document carries, on every transport — the caller is the
 # document issuer that proof establishes, not the transport's sender
 # (src/proof.rs). Also signs the `test-wake*` helpers' documents.
-affinidi-data-integrity = "0.8.0"
+affinidi-data-integrity = "0.9.2"
 # The acceptance window for a document's `issuedAt` and the retention of the
 # replay record (src/intake.rs). Already in the tree via trust-tasks-rs.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -91,10 +91,12 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # did-webs needs no `affinidi-keri` and so no LMDB. The feature reaches every
 # resolver in the gateway — the proof verifier's, the TSP self-check's and the
 # DIDComm listener's (`TDKConfig`) — because the graph holds one copy of this crate.
-affinidi-did-resolver-cache-sdk = { version = "0.8.52", features = ["network", "did-webs"] }
+# 0.9 is the Fig line (affinidi-tdk 0.49, `affinidi-did-webs` 0.14); every 0.9
+# release is past all of the floors above.
+affinidi-did-resolver-cache-sdk = { version = "0.9", features = ["network", "did-webs"] }
 # did:scid identities (VTI-KEY-160): `scid::strip_scid_src` / `same_reference`
-# compare a DID URL carrying a `?src=` locator by its DID. Needs 0.4.4.
-affinidi-did-common = "0.4.4"
+# compare a DID URL carrying a `?src=` locator by its DID. 0.5 is the Fig line.
+affinidi-did-common = "0.5"
 tokio-util = "0.7"
 # Async push senders (real delivery — Web Push / APNs — is async HTTP).
 async-trait = "0.1"
@@ -164,5 +166,5 @@ tokio = { version = "1", features = ["test-util"] }
 # Creates a did:webs for a local fixture server in tests/did_webs.rs, so its
 # resolution is tested offline. `create` builds on `affinidi-keri` with its
 # default features off, so the test graph gains no LMDB either.
-affinidi-did-webs = { version = "0.13.3", features = ["create"] }
+affinidi-did-webs = { version = "0.14", features = ["create"] }
 

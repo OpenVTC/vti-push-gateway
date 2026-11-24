@@ -12,18 +12,18 @@
 use std::sync::Arc;
 
 use affinidi_data_integrity::{DataIntegrityProof, SignOptions};
-use affinidi_did_resolver_cache_sdk::{config::DIDCacheConfigBuilder, DIDCacheClient};
+use affinidi_did_resolver_cache_sdk::{DIDCacheClient, config::DIDCacheConfigBuilder};
 use affinidi_secrets_resolver::secrets::Secret;
 use ed25519_dalek::SigningKey;
 use rand::Rng;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use axum::body::Body;
 use axum::http::Request;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use vti_push_gateway::api::{router, AppState};
+use vti_push_gateway::api::{AppState, router};
 use vti_push_gateway::controllers::ControllerPolicy;
 use vti_push_gateway::egress::EgressPolicy;
 use vti_push_gateway::intake;
@@ -1036,9 +1036,11 @@ async fn a_tsp_payload_outside_the_binding_envelope_is_refused() {
     assert!(is_success(&resp), "{resp}");
 
     assert!(tsp::receive(&st, &vta.did, b"not json").await.is_none());
-    assert!(tsp::receive(&st, &vta.did, br#"{"hello":"world"}"#)
-        .await
-        .is_none());
+    assert!(
+        tsp::receive(&st, &vta.did, br#"{"hello":"world"}"#)
+            .await
+            .is_none()
+    );
     let empty = serde_json::to_vec(&json!({ "type": tsp::ENVELOPE_TYPE })).unwrap();
     assert!(tsp::receive(&st, &vta.did, &empty).await.is_none());
 }

@@ -49,7 +49,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::egress::EgressPolicy;
 use crate::secretfile;
-use crate::types::{is_bounded_did, PushRegistration, WakeTriggerPolicy};
+use crate::types::{PushRegistration, WakeTriggerPolicy, is_bounded_did};
 
 /// Unix seconds, or 0 if the clock is before the epoch.
 fn now_secs() -> u64 {
@@ -851,10 +851,12 @@ mod tests {
         // The sentinel is unchanged: nothing was written through the symlink.
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"untouched");
         // The planted link is still just a dangling-free symlink, not a snapshot.
-        assert!(std::fs::symlink_metadata(&planted)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&planted)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         // And the real snapshot has the token.
         let snapshot = std::fs::read_to_string(&path).unwrap();
         assert!(snapshot.contains(&"a1".repeat(32)), "{snapshot}");

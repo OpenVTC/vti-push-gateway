@@ -43,11 +43,11 @@ use affinidi_messaging_didcomm_service::{
 };
 use affinidi_tdk::messaging::protocols::tsp::ControlMessage;
 use affinidi_tdk::tsp::message::control::ControlType;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use trust_tasks_rs::{RejectReason, TrustTask};
 pub use trust_tasks_tsp::ENVELOPE_TYPE;
 
-use crate::api::{reject_value, AppState};
+use crate::api::{AppState, reject_value};
 use crate::intake;
 
 /// DID-document service type a TSP endpoint is advertised under.

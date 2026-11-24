@@ -19,20 +19,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
+    Json, Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Request, State},
     http::{
-        header::{AUTHORIZATION, CONTENT_TYPE},
         StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
     },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
 use rand::Rng;
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use trust_tasks_rs::{RejectReason, TrustTask};
 use uuid::Uuid;
 
@@ -331,18 +331,18 @@ pub(crate) async fn dispatch_push_once(
             handle_register(state, doc).await
         }
         ("push/provision", 0, 2) => {
-            if let Some(caller) = sender.as_deref() {
-                if !state.limits.allow_did(caller) {
-                    return rate_limited(doc, "push/provision");
-                }
+            if let Some(caller) = sender.as_deref()
+                && !state.limits.allow_did(caller)
+            {
+                return rate_limited(doc, "push/provision");
             }
             handle_provision(state, sender, doc, once).await
         }
         ("push/wake", 0, 2) => {
-            if let Some(caller) = sender.as_deref() {
-                if !state.limits.allow_did(caller) {
-                    return rate_limited(doc, "push/wake");
-                }
+            if let Some(caller) = sender.as_deref()
+                && !state.limits.allow_did(caller)
+            {
+                return rate_limited(doc, "push/wake");
             }
             handle_wake(state, sender, doc, once).await
         }

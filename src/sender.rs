@@ -18,17 +18,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use base64::Engine;
 use http::{
-    header::{AUTHORIZATION, CONTENT_TYPE},
     HeaderValue, Uri,
+    header::{AUTHORIZATION, CONTENT_TYPE},
 };
-use p256::ecdsa::{signature::Signer, Signature, SigningKey};
-use p256::pkcs8::DecodePrivateKey;
 use p256::SecretKey;
+use p256::ecdsa::{Signature, SigningKey, signature::Signer};
+use p256::pkcs8::DecodePrivateKey;
 use web_push_native::{Auth, WebPushBuilder};
 
 use crate::egress::{self, EgressPolicy};
 use crate::types::{
-    is_valid_apns_token, ApnsEnvironment, PushRegistration, Urgency, WakePayload, WebPushKeys,
+    ApnsEnvironment, PushRegistration, Urgency, WakePayload, WebPushKeys, is_valid_apns_token,
 };
 
 /// Build the HTTP client every push sender uses: see
@@ -400,10 +400,10 @@ impl ApnsSender {
     fn provider_token(&self) -> Option<String> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
         let mut guard = self.token.lock().ok()?;
-        if let Some(t) = guard.as_ref() {
-            if now.saturating_sub(t.iat) < APNS_TOKEN_REFRESH_SECS {
-                return Some(t.jwt.clone());
-            }
+        if let Some(t) = guard.as_ref()
+            && now.saturating_sub(t.iat) < APNS_TOKEN_REFRESH_SECS
+        {
+            return Some(t.jwt.clone());
         }
         let header = b64url(
             &serde_json::to_vec(&serde_json::json!({
@@ -623,10 +623,10 @@ impl FcmSender {
     async fn access_token(&self) -> Option<String> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
         let mut guard = self.token.lock().await;
-        if let Some(t) = guard.as_ref() {
-            if now.saturating_sub(t.obtained_at) < t.ttl.min(FCM_TOKEN_REFRESH_SECS) {
-                return Some(t.token.clone());
-            }
+        if let Some(t) = guard.as_ref()
+            && now.saturating_sub(t.obtained_at) < t.ttl.min(FCM_TOKEN_REFRESH_SECS)
+        {
+            return Some(t.token.clone());
         }
         let assertion = self.assertion_jwt(now)?;
         // application/x-www-form-urlencoded by hand: the assertion is base64url
@@ -998,7 +998,7 @@ JIdgVjmcJ6J16mUbDYosCYI=
     /// service-account public key — proving the aws-lc-rs RS256 path works.
     #[test]
     fn fcm_assertion_is_a_valid_rs256_jwt() {
-        use aws_lc_rs::signature::{KeyPair, UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256};
+        use aws_lc_rs::signature::{KeyPair, RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 
         let s = FcmSender::new(&fcm_service_account_json()).expect("FcmSender::new");
         let now = 1_700_000_000;

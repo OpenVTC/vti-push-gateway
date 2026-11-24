@@ -39,11 +39,11 @@ rand = "0.10"
 # (TSP, DIDComm, HTTPS), all through one intake (src/intake.rs).
 # No spec families are enabled: the push/* bodies are modelled in src/types.rs,
 # so none of the deprecated prebuilt `specs::` modules is used.
-trust-tasks-rs = { version = "0.41.0", default-features = false }
+trust-tasks-rs = { version = "0.41.2", default-features = false }
 # The proof-purpose contract for a document's Data Integrity proof:
 # `ProofPurposeResolver` releases a key only for the relationship the proof
 # declares, and `PurposeBound` applies it when verifying (src/proof.rs).
-trust-tasks-proof = "0.41.0"
+trust-tasks-proof = "0.41.2"
 # Response document ids (urn:uuid).
 uuid = { version = "1", features = ["v4"] }
 # DIDComm server transport (the preferred transport). Mirrors vta-service:
@@ -59,12 +59,12 @@ uuid = { version = "1", features = ["v4"] }
 # These move in lockstep with `trust-tasks-rs`: didcomm-service 0.38 and
 # affinidi-tdk 0.49 are on `affinidi-messaging-sdk` 0.50 — the Fig set VTI is
 # on (vta-sdk 0.92, trust-tasks 0.41).
-affinidi-messaging-didcomm-service = { version = "0.38.0", features = ["tsp"] }
-affinidi-tdk = { version = "0.49", features = ["tsp"] }
+affinidi-messaging-didcomm-service = { version = "0.39.0", features = ["tsp"] }
+affinidi-tdk = { version = "0.50", features = ["tsp"] }
 # The TSP Trust Task binding (https://trusttasks.org/binding/tsp/0.1): its
 # envelope type, so the gateway opens and wraps the same
 # `{"type": …/envelope, "document": …}` payload the rest of the stack sends.
-trust-tasks-tsp = { version = "0.41.0", default-features = false }
+trust-tasks-tsp = { version = "0.41.2", default-features = false }
 affinidi-secrets-resolver = "0.6"
 # Data Integrity (`eddsa-jcs-2022`) verification of the proof a `push/provision`
 # or `push/wake` document carries, on every transport — the caller is the
